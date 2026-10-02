@@ -1,0 +1,38 @@
+ClipDock 0.1.0 - a desktop downloader for YouTube video, audio, and captions,
+written in Python with PySide6 and yt-dlp.
+
+
+WHAT HAPPENS ON THE FIRST RUN
+  1. ClipDock opens.
+
+  2. Before its window appears, it checks whether this computer already has the
+     one external program it needs, called FFmpeg. That check takes a moment
+     and downloads nothing.
+
+  3. If FFmpeg is already installed anywhere on this computer - in Program
+     Files, on the PATH, inside another program, or in ClipDock's own shared
+     folder - ClipDock uses that copy and says nothing about it.
+
+  4. Only if FFmpeg is genuinely missing does ClipDock ask whether to download
+     it, and if you agree it installs one copy for the whole computer so a
+     second person never repeats the download. Declining is a normal answer:
+     the program still opens, and only the step that merges a video's picture
+     and sound together stays unavailable.
+
+
+WHY WINDOWS MAY SHOW A BLUE WARNING
+  This installer is not signed with a paid code-signing certificate. Windows
+  therefore cannot vouch for the file and may show a blue "Windows protected
+  your PC" message with the publisher listed as "Unknown publisher".
+
+  This is expected. It is not a sign that anything is wrong with this
+  installer. Click "More info" at the bottom of that window, then "Run anyway".
+
+  If you were sent this installer by someone, you can also ask them for the
+  SHA-256 fingerprint of the file and compare it before you run it.
+
+
+UNINSTALLING
+  ClipDock can be removed at any time from Windows Settings, Apps, Installed
+  apps. Removing it does not remove the FFmpeg copy from step 4, because other
+  programs on this computer may be using it.

@@ -1,0 +1,30 @@
+# Line endings, so that a clone on Windows and a clone on Linux do not disagree
+# about every line of every file.
+#
+# Without this, `core.autocrlf` decides per machine. A Windows contributor with
+# autocrlf=true commits CRLF into the repository itself, and the next person to
+# clone it on Linux sees every single line as changed. That is a real and very
+# common way a public repository turns into noise.
+#
+# `text=auto` lets git detect text vs binary per file, stores text with LF in
+# the repository, and checks it out with the platform's own convention.
+
+* text=auto
+
+# These genuinely require CRLF. A .cmd or .bat with LF-only endings fails
+# intermittently in ways that look like nothing at all is wrong, which is the
+# worst kind of failure to debug.
+*.bat text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# Binary: never touched, never diffed, never line-ending converted.
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.exe binary
+*.dll binary
+*.pyd binary
+*.zip binary

@@ -1,0 +1,81 @@
+# ---------------------------------------------------------------------------
+# ClipDock - what is deliberately NOT in the repository.
+#
+# Three of the four large folders here are generated, and all three are
+# reproducible from a clean checkout by running scripts\setup.ps1 and then
+# scripts\build_installer.ps1.  Keeping them out of git is not only about size:
+# a committed .venv or vendor\ folder goes stale against requirements.txt, and
+# nothing then tells you which of the two the tests actually ran against.
+# ---------------------------------------------------------------------------
+
+# --- Python bytecode -------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Virtual environment ---------------------------------------------------
+# Recreated by scripts\setup.ps1, which also fetches and checksum-verifies the
+# pinned dependencies below.
+.venv/
+venv/
+env/
+.Python
+
+# --- Dependencies fetched at setup time ------------------------------------
+# ~145 MB of FFmpeg.  tools\fetch_dependencies.py verifies it against the
+# SHA-256 pins in tools\fetch_dependencies.py itself, so an absent folder is
+# rebuilt and verified rather than trusted.
+vendor/
+
+# --- Build output ----------------------------------------------------------
+# dist\ClipDock\        the PyInstaller folder build_exe.ps1 produces
+# dist\ClipDock-Setup.exe  the installer, ~47 MB
+#
+# Neither belongs in version control.  dist\ClipDock-Setup.exe is a release
+# artefact: attach it to a GitHub Release instead of committing it, so the tag
+# and the file that was tagged stay in agreement.
+dist/
+build/
+*.egg-info/
+.eggs/
+
+# --- PyInstaller -----------------------------------------------------------
+# Written beside the sources during a build; regenerated every time.
+*.spec
+
+# --- Test, lint and coverage output ----------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# --- Icon generator output -------------------------------------------------
+# tools\make_icon.py renders every size it needs to disk next to the .ico.
+#
+# assets\app.ico IS committed and the glob below deliberately excludes it: the
+# program loads that file at runtime, build_exe.ps1 packs it, and a test
+# requires it to be byte-identical to what the generator produces today, so it
+# must never drift out of the repository.  The PNGs are intermediate renders
+# that nothing reads, which is exactly why they are the ones ignored.
+assets/app-*.png
+
+# --- Runtime output, wherever the program happens to run --------------------
+*.log
+logs/
+settings.json
+
+# --- Editor and operating-system noise -------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+*.swp
+*~
+*.tmp
+*.bak
+*.orig
+*.rej
