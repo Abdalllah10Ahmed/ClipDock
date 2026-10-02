@@ -17,9 +17,11 @@ Two things to expect on a machine that has not run ClipDock before:
 - **An unsigned-binary warning.** The installer is not code-signed, so Windows SmartScreen may show "Windows protected your PC". Click **More info**, then **Run anyway**. This is the cost of not buying a signing certificate, and it is the only thing about the install that should surprise anyone. The installer's first page says the same thing before anything is written to disk.
 - **A first-run FFmpeg question.** ClipDock looks for FFmpeg anywhere on the machine first, and only asks to download it if it genuinely cannot find one. It is the only thing ever downloaded. Answering no is fine — the program opens anyway and every other feature still works; only video merging, MP3 conversion, and cover-art embedding need it.
 
-![The dialog ClipDock shows before its window opens, when the computer has no FFmpeg: what it is for, how large the download is, and where it would be installed](docs/screenshot-first-run.png)
+<p align="center">
+  <img src="docs/screenshot-first-run.png" alt="The dialog ClipDock shows before its window opens, when the computer has no FFmpeg: what it is for, how large the download is, and where it would be installed">
+</p>
 
-<sub>What a first launch looks like on a computer with no FFmpeg. It asks before spending anything, names the size and the destination folder up front, and **Not now** is a real answer rather than a dismissal — the window opens anyway. The wording, the download size, the install folder and the free-space check in that picture are all live; the one thing staged is the device search being told it found nothing, so the dialog has something to offer. Reproduce it with `.\.venv\Scripts\python.exe tools\make_screenshot.py --view first-run`.</sub>
+<p align="center"><sub>What a first launch looks like on a computer with no FFmpeg. It asks before spending anything, names the size and the destination folder up front, and <b>Not now</b> is a real answer rather than a dismissal — the window opens anyway. The wording, the download size, the install folder and the free-space check in that picture are all live; the one thing staged is the device search being told it found nothing, so the dialog has something to offer. Reproduce it with <code>.\.venv\Scripts\python.exe tools\make_screenshot.py --view first-run</code>.</sub></p>
 
 Nothing else is needed. Python, PySide6, and yt-dlp are all inside the installer. To check the file you downloaded, compare its SHA-256 with the one published alongside it on the Releases page.
 
