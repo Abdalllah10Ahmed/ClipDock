@@ -1,5 +1,12 @@
 # Third-party notices
 
+**This license applies to ClipDock's own code only.** ClipDock is MIT licensed
+(see `LICENSE`), and that permission does not extend to anything listed below.
+Each component keeps its own terms, and redistributing ClipDock means
+redistributing these too - so their obligations apply to you, not just to us.
+In particular, **PySide6 is LGPL**, which imposes real conditions on anyone who
+ships it, and FFmpeg is an LGPL build for the same reason.
+
 This project is intended for Windows 10/11 and uses the following third-party components. The complete license texts are distributed with the corresponding packages/builds and should accompany any redistributed application bundle.
 
 ## PySide6 / Qt for Python

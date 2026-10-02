@@ -19,11 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
---------------------------------------------------------------------------------
-
-Third-party components bundled or used by ClipDock are NOT covered by this
-license.  ClipDock is distributed with PySide6 and yt-dlp, each under its own
-terms; see THIRD_PARTY_NOTICES.md for the specific licenses and versions, and
-note in particular that PySide6 is LGPL, which imposes obligations on anyone
-who redistributes it.
