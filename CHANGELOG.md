@@ -64,5 +64,5 @@ First public release. Everything below is new.
 - No runtime dependency beyond PySide6 and yt-dlp; both are bundled. FFmpeg is
   the only thing ever downloaded, and only after asking.
 
-[Unreleased]: https://github.com/OWNER/ClipDock/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/OWNER/ClipDock/releases/tag/v0.1.0
+[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/Abdalllah10Ahmed/ClipDock/releases/tag/v0.1.0

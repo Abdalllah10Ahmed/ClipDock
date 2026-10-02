@@ -6,7 +6,7 @@ The application is named **ClipDock** after the "dock" its downloads land in. It
 
 ## Install
 
-Download **`ClipDock-Setup.exe`** from the [Releases](https://github.com/OWNER/ClipDock/releases) page and run it. Next, Next, choose a folder, done. It installs for your user account only, so it never asks for administrator rights.
+Download **`ClipDock-Setup.exe`** from the [Releases](https://github.com/Abdalllah10Ahmed/ClipDock/releases) page and run it. Next, Next, choose a folder, done. It installs for your user account only, so it never asks for administrator rights.
 
 Two things to expect on a machine that has not run ClipDock before:
 
@@ -116,7 +116,7 @@ The application uses the pinned yt-dlp Python wheel for extraction and the bundl
 ## Setup and run
 
 ```powershell
-git clone https://github.com/OWNER/ClipDock.git
+git clone https://github.com/Abdalllah10Ahmed/ClipDock.git
 cd ClipDock
 .\scripts\setup.ps1
 .\scripts\run.ps1
@@ -287,6 +287,6 @@ That does not extend to the components ClipDock bundles. PySide6 is **LGPL**, wh
 Patches are welcome. Two things matter more than style here:
 
 - **`requirements.txt` is pinned exactly and deliberately.** Two packages, no ranges. Adding a runtime dependency is a design decision, not a convenience — it changes what every recipient downloads and has to trust. Ask before adding one.
-- **Run the suite before sending a patch.** `.\.venv\Scripts\python.exe -m unittest discover -s tests`. It is 199 tests and takes about four and a half minutes, most of it real FFmpeg work. A change that makes it slower or flakier is a change that needs explaining.
+- **Run the suite before sending a patch.** `.\.venv\Scripts\python.exe -m unittest discover -s tests`. It is 200 tests and takes about four and a half minutes, most of it real FFmpeg work. A change that makes it slower or flakier is a change that needs explaining.
 
 Tests must never touch the real `%LOCALAPPDATA%`, `%ProgramData%`, `PATH`, or network. Several redirect all four deliberately; if you add a test that reads a real device setting, it will pass on your machine and fail on someone else's.
