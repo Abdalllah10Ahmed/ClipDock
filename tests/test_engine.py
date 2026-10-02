@@ -8,6 +8,8 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 from youtube_downloader.core.engine import (
+    CLEAN_OUTTMPL,
+    ID_OUTTMPL,
     Engine,
     _ProgressRelay,
     _retry_backoff,
@@ -38,6 +40,26 @@ from youtube_downloader.core.models import (
 # Long enough to clear the engine's 0.10s progress throttle, so simulated hook
 # events are not all collapsed into the first one.
 _PROGRESS_TICK = 0.12
+
+
+def expand_template(template: str, title: str, video_id: str, extension: str) -> str:
+    """Expand the slice of yt-dlp's output template the fakes actually use.
+
+    The fakes used to write a hardcoded ``Title [id].ext`` and ignore the
+    template entirely, which is why no test noticed when the naming changed.
+    Expanding the real template keeps them honest: if the engine hands over a
+    different one, the file these fakes create moves with it.
+    """
+
+    name = template
+    for field, value in (
+        ("%(title).180B", title),
+        ("%(title)s", title),
+        ("%(id)s", video_id),
+        ("%(ext)s", extension.lstrip(".")),
+    ):
+        name = name.replace(field, value)
+    return name
 
 
 class FakeYdl:
@@ -110,7 +132,7 @@ class FakeYdl:
             return data
         self.downloaded = True
         template = self.options["outtmpl"]["default"]
-        base = Path(template).parent / "Example video [video123]"
+        base = Path(expand_template(template, "Example video", "video123", "mp4")).with_suffix("")
         if self.options.get("skip_download"):
             # A caption run writes one file per language and saves no media.
             # Real yt-dlp reports these under requested_subtitles, not in
@@ -268,7 +290,7 @@ class FakePlaylistYdl:
             for item in (self.options.get("postprocessors") or [])
         )
         extension = ".mp3" if wants_audio else ".mp4"
-        output = Path(template).parent / f"{data['title']} [{video_id}]{extension}"
+        output = Path(expand_template(template, data["title"], video_id, extension))
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"playlist media")
         return {
@@ -328,6 +350,142 @@ class FakeStreamYdl:
             "title": "Stream comparison",
             "requested_downloads": [{"filepath": str(output)}],
         }
+
+
+class FilenameTests(unittest.TestCase):
+    """Clean filenames by default, the video id only where one is actually needed.
+
+    The collision half of this needs a real ``YoutubeDL``, because the engine
+    deliberately asks yt-dlp for the filename rather than predicting it -- yt-dlp
+    owns the Windows sanitisation, the reserved device names, and the 180
+    character trim, and the fakes elsewhere in this file cannot answer that
+    question.  The other half is asserted through the fakes, which expand the
+    real template, so a change to the template moves the file they create.
+    """
+
+    def setUp(self) -> None:
+        FakeYdl.instances.clear()
+        FakeYdl.fail_after_subtitles = 0
+        FakePlaylistYdl.instances.clear()
+        FakePlaylistYdl.download_order.clear()
+        self.engine = Engine(ydl_factory=FakeYdl, ffmpeg_path=Path("ffmpeg.exe"))
+        self.real_engine = Engine(ffmpeg_path=Path("ffmpeg.exe"))
+
+    @staticmethod
+    def _request(directory: str, video_id: str, title: str, mode: DownloadMode) -> DownloadRequest:
+        return DownloadRequest(
+            url=f"https://youtu.be/{video_id}",
+            output_dir=Path(directory),
+            mode=mode,
+            info=VideoInfo(
+                video_id=video_id,
+                title=title,
+                duration=100.0,
+                thumbnail_url=None,
+                qualities=(),
+                audio_available=True,
+            ),
+        )
+
+    def _taken(self, directory: str, video_id: str, title: str, extension: str, mode: DownloadMode) -> bool:
+        """Ask the real check, through a real YoutubeDL built as the engine builds one."""
+
+        request = self._request(directory, video_id, title, mode)
+        options = self.real_engine._base_options(Path(directory), _ProgressRelay(None, None))
+        options["paths"] = {"home": str(Path(directory)), "temp": str(Path(directory) / ".parts")}
+        ydl = self.real_engine._new_ydl(options)
+        return self.real_engine._clean_name_is_taken(ydl, request, extension)
+
+    def test_a_free_name_is_not_reported_as_taken(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertFalse(self._taken(directory, "aaa", "Alan Walker - Faded", ".mp4", DownloadMode.VIDEO))
+
+    def test_the_same_title_under_a_different_id_is_reported_as_taken(self) -> None:
+        # The case the id exists for: a playlist of videos all called
+        # "Official Video", where the second would otherwise be reported as
+        # already downloaded and quietly never saved.
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "Alan Walker - Faded.mp4").write_bytes(b"x")
+            self.assertTrue(self._taken(directory, "bbb", "Alan Walker - Faded", ".mp4", DownloadMode.VIDEO))
+
+    def test_a_different_title_is_unaffected_by_a_taken_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "Alan Walker - Faded.mp4").write_bytes(b"x")
+            self.assertFalse(self._taken(directory, "ccc", "Alan Walker - Ignite", ".mp4", DownloadMode.VIDEO))
+
+    def test_a_caption_file_is_found_despite_its_language_code(self) -> None:
+        # A caption file is "Title.en.srt", so checking only for "Title.srt"
+        # would miss it and two same-titled videos would overwrite each other.
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "Alan Walker - Faded.en.srt").write_text("x", encoding="utf-8")
+            self.assertTrue(self._taken(directory, "ddd", "Alan Walker - Faded", ".srt", DownloadMode.SUBTITLES))
+
+    def test_a_media_download_is_not_confused_by_a_caption_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "Alan Walker - Faded.en.srt").write_text("x", encoding="utf-8")
+            self.assertFalse(self._taken(directory, "eee", "Alan Walker - Faded", ".mp4", DownloadMode.VIDEO))
+
+    def test_an_empty_title_never_claims_a_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / ".srt").write_text("x", encoding="utf-8")
+            self.assertFalse(self._taken(directory, "fff", "", ".srt", DownloadMode.SUBTITLES))
+
+    def test_the_download_actually_writes_the_clean_name(self) -> None:
+        # The end-to-end version: a real download through the fakes, asserting on
+        # the file that appears rather than on the options that were passed.
+        info = self.engine.probe("https://youtu.be/video123")
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.engine.download_video(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.VIDEO,
+                    info=info,
+                    quality=info.qualities[0],
+                )
+            )
+            self.assertEqual(result.path.name, "Example video.mp4")
+            self.assertNotIn("[video123]", result.path.name)
+
+    def test_the_caption_rescue_ignores_files_a_previous_run_left_behind(self) -> None:
+        # The rescue used to find files by searching for the video id, which
+        # matched any caption file for that video however old -- so a repeat
+        # failure would report the *first* run's files as this run's work.
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "Example video.en.srt").write_text("old", encoding="utf-8")
+            request = self._request(directory, "video123", "Example video", DownloadMode.SUBTITLES)
+
+            # A snapshot taken now sees the stale file, so it is not reported.
+            self.assertEqual(
+                self.engine._caption_files_written_since(
+                    request, SubtitleFormat.SRT.extension, self.engine._folder_snapshot(Path(directory))
+                ),
+                (),
+            )
+
+            # A snapshot taken before that file existed reports it, and reports
+            # only what appeared afterwards.  Compared by name because
+            # _prepare_output_dir resolves the path, and on this machine that
+            # turns the long folder name into its 8.3 short form.
+            fresh = Path(directory) / "Example video.fr.srt"
+            fresh.write_text("new", encoding="utf-8")
+            found = self.engine._caption_files_written_since(
+                request, SubtitleFormat.SRT.extension, frozenset({"Example video.en.srt"})
+            )
+            self.assertEqual([path.name for path in found], ["Example video.fr.srt"])
+
+    def test_both_templates_are_written_down_once(self) -> None:
+        # They used to be spelled out in two places and drifted; a third copy in
+        # the caption rescue is what broke silently.  This pins that there is one
+        # clean template and one fallback, and that the fallback differs only by
+        # the id.
+        import inspect
+
+        source = inspect.getsource(Engine)
+        self.assertEqual(source.count('"%(title).180B.%(ext)s"') + source.count('"%(title).180B [%(id)s].%(ext)s"'), 0,
+                         "a template literal is back inside engine.py")
+        self.assertEqual(CLEAN_OUTTMPL, "%(title).180B.%(ext)s")
+        self.assertEqual(ID_OUTTMPL, "%(title).180B [%(id)s].%(ext)s")
 
 
 class EngineTests(unittest.TestCase):

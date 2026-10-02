@@ -74,6 +74,16 @@ CAPTION_REQUEST_INTERVAL = 0.6
 # consume the whole slice and the bar would then sit frozen for the download.
 _ITEM_PROBE_SHARE = 0.15
 
+# A clean filename is the default: "Alan Walker - Faded.mp3", not
+# "Alan Walker - Faded [60ItHLz5WEA].mp3".  The id-bearing form is kept only
+# for the one case that needs it -- a title already present in the folder.
+# Dropping the id unconditionally would give two different videos both called
+# "Official Video" the same name, and with `overwrites: False` the second would
+# report itself already downloaded rather than saving a file.  Both forms live
+# here because they used to be written out twice and could drift apart.
+CLEAN_OUTTMPL = "%(title).180B.%(ext)s"
+ID_OUTTMPL = "%(title).180B [%(id)s].%(ext)s"
+
 
 def item_slice_progress(
     item_index: int,
@@ -337,7 +347,7 @@ class Engine:
             "overwrites": False,
             "cachedir": False,
             "paths": {"home": str(output_dir), "temp": str(output_dir / ".parts")},
-            "outtmpl": {"default": str(output_dir / "%(title).180B [%(id)s].%(ext)s")},
+            "outtmpl": {"default": str(output_dir / CLEAN_OUTTMPL)},
             "progress_hooks": [self._yt_dlp_progress_hook(progress)],
             "postprocessor_hooks": [self._postprocessor_hook(progress)],
         }
@@ -574,29 +584,46 @@ class Engine:
         preferred = sorted({track.language_code for track in info.manual_subtitle_tracks})
         return (preferred or automatic)[:MAX_SUBTITLE_LANGUAGES]
 
-    def _existing_caption_files(self, request: DownloadRequest, extension: str) -> tuple[Path, ...]:
-        """Caption files for this video that are already in the output folder.
+    def _folder_snapshot(self, output_dir: Path) -> frozenset[str]:
+        """Names present in the output folder, for spotting what a run just wrote."""
+
+        try:
+            return frozenset(entry.name for entry in output_dir.iterdir())
+        except OSError:
+            return frozenset()
+
+    def _caption_files_written_since(
+        self,
+        request: DownloadRequest,
+        extension: str,
+        before: frozenset[str],
+    ) -> tuple[Path, ...]:
+        """Caption files that appeared while this run was in progress.
 
         Used to rescue a run that YouTube cut short, so a part-finished batch of
-        languages is reported instead of thrown away.  The output template puts
-        the video id in square brackets, so the folder is listed and filtered by
-        name rather than globbed: ``[`` and ``]`` are glob metacharacters and
-        would not match themselves.
+        languages is reported instead of thrown away.
+
+        This is a before-and-after diff rather than a search by name.  Matching
+        on the filename used to mean repeating the output template's rules here,
+        which is how a clean filename silently stopped being found: the marker
+        it looked for -- the video id in square brackets -- is only in the
+        fallback template.  A diff needs no naming rules at all, so it cannot
+        fall behind the template, and it is also stricter than what it replaced:
+        a caption file left by an *earlier* run is no longer picked up and
+        reported as part of this one.
         """
 
         output_dir = self._prepare_output_dir(request.output_dir)
-        video_id = request.info.video_id
-        if not video_id:
-            return ()
-        marker = f"[{video_id}]"
-        suffix = extension.lower()
+        # SubtitleFormat.extension carries the dot and Path.suffix does too, but
+        # normalising removes a trap where a mismatch silently reports nothing.
+        suffix = f".{extension.lstrip('.').lower()}"
         found: list[Path] = []
         try:
             entries = sorted(output_dir.iterdir())
         except OSError:
             return ()
         for path in entries:
-            if marker not in path.name or path.suffix.lower() != suffix:
+            if path.name in before or path.suffix.lower() != suffix:
                 continue
             try:
                 if path.is_file() and path.stat().st_size > 0:
@@ -649,6 +676,10 @@ class Engine:
                 "postprocessors": [],
             }
         )
+        output_dir = self._prepare_output_dir(request.output_dir)
+        # Taken before the run so a cut-short one can be told exactly which
+        # caption files it managed to write.
+        already_there = self._folder_snapshot(output_dir)
         try:
             return self._download_with_ydl(request, options, relay, request.subtitle_format.extension)
         except CancelledError:
@@ -658,7 +689,9 @@ class Engine:
             # caption requests.  The files already written are still what the
             # person asked for, so they are reported with a note about the cap
             # instead of being presented as a total failure.
-            written = self._existing_caption_files(request, request.subtitle_format.extension)
+            written = self._caption_files_written_since(
+                request, request.subtitle_format.extension, already_there
+            )
             if not written:
                 raise
             self._logger.warning(
@@ -1209,6 +1242,49 @@ class Engine:
             return paths[0]
         raise DownloadFailure(f"The requested {extension.upper()[1:]} file was not produced.", code="missing_output")
 
+    def _clean_name_is_taken(
+        self,
+        ydl: Any,
+        request: DownloadRequest,
+        expected_extension: str,
+    ) -> bool:
+        """Whether the clean filename for this item already exists on disk.
+
+        The name is *asked of yt-dlp* rather than predicted here.  It owns the
+        Windows character sanitisation, the 180-character trim, the reserved
+        device names, and the `%(title).180B` length-limited form, and a
+        hand-rolled copy of those rules would disagree with it somewhere obscure
+        -- and the disagreement would look exactly like "no collision".
+
+        A false positive only costs a tidier filename; a false negative costs a
+        silently unsaved video, so the check errs towards appending the id.
+        """
+        info = request.info
+        if not info.title:
+            return False
+        probe = {
+            "id": info.video_id,
+            "title": info.title,
+            "ext": expected_extension.lstrip("."),
+        }
+        try:
+            candidate = ydl.prepare_filename(probe)
+        except (ValueError, KeyError, TypeError, IndexError, AttributeError):
+            return False
+        if not candidate or candidate == "-":
+            return False
+        path = Path(candidate)
+        if path.exists():
+            return True
+        if request.mode is DownloadMode.SUBTITLES:
+            # A caption file carries a language code the media name does not, and
+            # it goes *before* the extension -- "Title.en.srt", not "Title.srt".
+            # So the exact name above is only one candidate; match on the stem.
+            # Two different videos sharing a title and a language really would
+            # overwrite each other here.
+            return any(path.parent.glob(f"{path.stem}.*"))
+        return False
+
     def _download_with_ydl(
         self,
         request: DownloadRequest,
@@ -1223,9 +1299,17 @@ class Engine:
         except UrlValidationError as error:
             raise ExtractionError(str(error), code="invalid_url") from error
         output_dir = self._prepare_output_dir(request.output_dir)
-        options["outtmpl"] = {"default": str(output_dir / "%(title).180B [%(id)s].%(ext)s")}
+        options["outtmpl"] = {"default": str(output_dir / CLEAN_OUTTMPL)}
         options["paths"] = {"home": str(output_dir), "temp": str(output_dir / ".parts")}
         ydl = self._new_ydl(options)
+        if self._clean_name_is_taken(ydl, request, expected_extension):
+            # yt-dlp reads the template out of params each time it names a file,
+            # so switching it here is enough and saves building a second YoutubeDL.
+            ydl.params.setdefault("outtmpl", {})["default"] = str(output_dir / ID_OUTTMPL)
+            self._logger.info(
+                "filename_disambiguated video_id=%s because_the_title_is_already_taken",
+                request.info.video_id,
+            )
         # Added as instances rather than named in ``options`` because a caller
         # needs a postprocessor that yt-dlp does not register, and because the
         # order is then explicit: these run after everything the options list
