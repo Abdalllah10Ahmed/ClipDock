@@ -10,7 +10,15 @@ $setup = Join-Path $root "scripts\setup.ps1"
 $distRoot = Join-Path $root "dist"
 # The source distribution has its own folder name so it can never delete the
 # packaged executable produced by build_exe.ps1 (and vice versa).
-$appDir = Join-Path $distRoot "YouTubeDownloader-source"
+#
+# It was called YouTubeDownloader-source until 2026-10-02, a name kept from
+# before the product was renamed.  That decision's stated reason was that
+# renaming it "would delete a build the user may still want", which is not a
+# reason: a build is regenerated in seconds by re-running this script.  The
+# name was the only place the old product survived in the shipped program, and
+# on a public repository it read as leftover cruft in an otherwise renamed
+# project.  Only the folder name changed - what the script does did not.
+$appDir = Join-Path $distRoot "ClipDock-source"
 if (Test-Path $appDir) {
     Remove-Item $appDir -Recurse -Force
 }

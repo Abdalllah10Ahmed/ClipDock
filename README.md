@@ -141,7 +141,9 @@ From PowerShell in the project directory, once you already have the source:
 .\scripts\build.ps1
 ```
 
-This creates `dist\YouTubeDownloader-source` with the application, pinned dependency manifest, and checksum-verified `vendor` binaries. The target Windows machine still needs Python 3.10–3.14; run `.\setup.ps1` once in the copied directory before `start.cmd` if the Python packages are not already installed. No additional runtime or build dependency is introduced. It writes to a different folder than the executable build, so the two builds never overwrite each other.
+This creates `dist\ClipDock-source` with the application, pinned dependency manifest, and checksum-verified `vendor` binaries. The target Windows machine still needs Python 3.10–3.14; run `.\scripts\setup.ps1` once in the copied directory before `start.cmd` if the Python packages are not already installed. No additional runtime or build dependency is introduced. It writes to a different folder than the executable build, so the two builds never overwrite each other.
+
+Inside the copied folder, `start.cmd` sits at the top level and every script lives under `scripts\`, which is why the path above is `.\scripts\setup.ps1` and not `.\setup.ps1`.
 
 ## Build the Windows executable
 
