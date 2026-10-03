@@ -584,6 +584,55 @@ class Engine:
         preferred = sorted({track.language_code for track in info.manual_subtitle_tracks})
         return (preferred or automatic)[:MAX_SUBTITLE_LANGUAGES]
 
+    @staticmethod
+    def _subtitle_write_targets(
+        request: DownloadRequest, languages: list[str]
+    ) -> tuple[bool, bool]:
+        """Whether to write author-written captions, auto-generated ones, or both.
+
+        yt-dlp prefers an author-written track whenever ``writesubtitles`` is on,
+        so asking for the ASR track alone has to turn that off - otherwise
+        "Auto-generated" quietly hands back the human track for every language
+        that has one.
+
+        The pair otherwise follows ``subtitle_source``, but "Author-written
+        first" is a statement of preference in terms of track *quality*, not a
+        filter over track kind, and its ``help_text`` promises to "fall back to
+        auto-generated ones when a language has no human track".  So for that
+        source the pair is resolved from what the video actually advertises for
+        the languages being asked for.
+
+        Without that resolution the promise is not kept in either direction, and
+        both failures are silent because nothing is written and the run ends
+        with "The requested SRT file was not produced" - a complaint that reads
+        like a network problem and is not one:
+
+          * a language YouTube advertises only as a machine translation, under
+            the default source, asked yt-dlp for author-written tracks alone;
+          * a video with no author-written captions at all, where the fallback
+            in _subtitle_language_options picked the automatic codes while the
+            flags still forbade reading them.
+
+        Both were reported live on one video advertising 157 tracks.  A
+        language present in both sets keeps the human track, which is the whole
+        point of the preference, and a deliberate choice of the auto-generated
+        or all-tracks source is honoured for a hand-picked language - only the
+        *preference* is resolved from what is advertised.
+        """
+
+        source = request.subtitle_source
+        if source is SubtitleSource.AUTOMATIC:
+            return False, True
+        if source is SubtitleSource.ALL:
+            return True, True
+        author = {track.language_code for track in request.info.manual_subtitle_tracks}
+        generated = {track.language_code for track in request.info.automatic_subtitle_tracks}
+        wanted_author = [language for language in languages if language in author]
+        wanted_generated = [language for language in languages if language in generated]
+        if wanted_author or not wanted_generated:
+            return True, False
+        return False, True
+
     def _folder_snapshot(self, output_dir: Path) -> frozenset[str]:
         """Names present in the output folder, for spotting what a run just wrote."""
 
@@ -656,17 +705,13 @@ class Engine:
             request.subtitle_source is not SubtitleSource.PREFERRED,
         )
         options = self._base_options(request.output_dir, relay, ffmpeg=ffmpeg)
-        # yt-dlp prefers an author-written track whenever writesubtitles is on,
-        # so asking for ASR captions alone has to turn that off.  Otherwise
-        # "Auto-generated" would quietly hand back the human track for every
-        # language that has one.
-        asr_only = request.subtitle_source is SubtitleSource.AUTOMATIC
+        writesubtitles, writeautomaticsub = self._subtitle_write_targets(request, languages)
         options.update(
             {
                 # Captions only: the media itself is not saved.
                 "skip_download": True,
-                "writesubtitles": not asr_only,
-                "writeautomaticsub": request.subtitle_source is not SubtitleSource.PREFERRED,
+                "writesubtitles": writesubtitles,
+                "writeautomaticsub": writeautomaticsub,
                 "subtitlesformat": request.subtitle_format.value,
                 "subtitleslangs": languages,
                 # YouTube's caption endpoint starts answering HTTP 429 when a
