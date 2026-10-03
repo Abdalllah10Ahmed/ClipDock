@@ -15,7 +15,18 @@ printed at the end of `scripts/build_installer.ps1`.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **The progress bar pinned itself at 100% after *Fetch details* and did not move during the download.** Two separate defects, both verified to fail without their fix. The probe's 100% was still in `_progress_value` when the download began, so the clamp that stops a retried fragment making the bar jump backward turned it into a permanent floor; the reset now happens at the start of every operation rather than being left to the previous one's completion. Separately, a superseded worker's progress events were still reaching the bar, and `JobController` now drops them.
+
+### Added
+
+- **A Help menu**, as a `?` trigger in the drawn caption strip rather than a native menu bar, which would read as a second frame above a frameless window's caption. It carries *Check dependencies again*, which is now the way back to the FFmpeg offer after declining it - previously that meant closing and reopening the program - and *Remove the FFmpeg ClipDock installed*, which limits itself to ClipDock's own copy and never deletes an FFmpeg that belongs to another program.
+- **An update check for ClipDock itself.** It reports whether a newer release exists and links to the releases page. It does not download or install anything, and it is on demand rather than run at launch. `core/updates.py` has no download path at all, and a test pins its only two addresses.
+
+### Changed
+
+- **Downloaded filenames no longer carry ` [<video id>]`** - `Alan Walker - Faded [60ItHLz5WEA].mp3` is now `Alan Walker - Faded.mp3`. The id is still added when it is needed: if the clean name is taken, the id-suffixed template is used instead, so two videos with the same title cannot silently report each other as already downloaded.
 
 ## [0.1.0] - 2026-10-02
 
