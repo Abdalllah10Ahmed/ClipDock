@@ -1,3 +1,3 @@
 """ClipDock: a desktop downloader for YouTube video, audio, and captions."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
