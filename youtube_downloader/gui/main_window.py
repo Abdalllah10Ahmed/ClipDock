@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -35,6 +36,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import __version__
+from ..core.binaries import find_ffmpeg
+from ..core.dependencies import (
+    FFMPEG_INSTALLED_BYTES,
+    clear_cached_ffmpeg,
+    forget_discovery,
+    installed_ffmpeg,
+    missing_dependencies,
+    ytdlp_version,
+)
 from ..core.engine import (
     Engine,
     playlist_audio_size_bytes,
@@ -43,6 +54,7 @@ from ..core.engine import (
     select_playlist_video_quality,
 )
 from ..core.errors import AppError
+from ..core.logging_setup import get_logger
 from ..core.models import (
     MAX_SUBTITLE_LANGUAGES,
     DownloadMode,
@@ -63,10 +75,11 @@ from ..core.models import (
     format_size,
 )
 from ..core.settings import read_settings, write_setting
+from ..core.updates import RELEASES_URL, UpdateCheck, check_for_updates
 from ..core.urls import UrlValidationError, normalize_youtube_playlist_url, normalize_youtube_url
 from . import caption
 from .caption import CaptionButton
-from .dependencies import first_run_check
+from .dependencies import DependencyDialog, checked_devices
 from .selectors import SelectorComboBox
 from .themes import DEFAULT_THEME, THEMES, THEME_IDS, is_dark, theme_palette
 from .workers import JobController
@@ -263,6 +276,18 @@ class MainWindow(QMainWindow):
         # to agree, and a test checks that they do.
         self.title_bar_caption = caption_label
 
+        # A Help menu rather than a native menu bar.  The window is frameless
+        # with a drawn caption, so a menu bar above it would read as a second,
+        # competing frame.  It sits in the caption strip instead, and carries the
+        # only way back to the FFmpeg offer after it has been declined.
+        self.help_button = QPushButton("?", bar)
+        self.help_button.setObjectName("helpButton")
+        self.help_button.setFixedSize(46, TITLE_BAR_HEIGHT)
+        self.help_button.setToolTip("Help")
+        self.help_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.help_button.setMenu(self._build_help_menu())
+        layout.addWidget(self.help_button, 0)
+
         self.minimize_button = self._window_button(bar, caption.MINIMIZE, "Minimize")
         self.maximize_button = self._window_button(bar, caption.MAXIMIZE, "Maximize")
         self.close_button = self._window_button(bar, caption.CLOSE, "Close")
@@ -286,6 +311,221 @@ class MainWindow(QMainWindow):
             target.mouseDoubleClickEvent = self._title_double_click  # type: ignore[method-assign]
         self.title_bar = bar
         return bar
+
+    def _build_help_menu(self) -> QMenu:
+        """The Help menu, which is the only way back to the FFmpeg offer.
+
+        Before this existed, declining the first-run prompt meant closing and
+        reopening the program, because the check ran before the window was shown
+        and there was nothing else to click.  ``clear_cached_ffmpeg()`` had been
+        written for the removal half of this and called from nowhere at all.
+        """
+
+        menu = QMenu("Help", self)
+        updates = menu.addAction("Check for ClipDock &updates")
+        updates.setStatusTip(f"Ask GitHub whether {RELEASES_URL} has something newer")
+        updates.triggered.connect(self._check_for_updates)
+        menu.addSeparator()
+        check = menu.addAction("&Check dependencies again")
+        check.triggered.connect(self._check_dependencies_again)
+        self._remove_ffmpeg_action = menu.addAction("&Remove the FFmpeg ClipDock installed")
+        self._remove_ffmpeg_action.triggered.connect(self._remove_installed_ffmpeg)
+        menu.addSeparator()
+        menu.addAction("&About ClipDock").triggered.connect(self._show_about)
+        # Enabled or not depends on what is on disk, which changes under the
+        # program, so it is decided as the menu opens rather than once at build.
+        menu.aboutToShow.connect(self._refresh_help_menu)
+        # Also decided now, so the item is never briefly wrong before the first
+        # open - and so a test can read the state without opening a menu.
+        self._refresh_help_menu()
+        return menu
+
+    def _refresh_help_menu(self) -> None:
+        self._remove_ffmpeg_action.setEnabled(installed_ffmpeg() is not None)
+
+    def _check_for_updates(self) -> None:
+        """Ask GitHub whether a newer release exists.  Report it; never fetch it.
+
+        It runs through the same controller a download uses, so the window keeps
+        responding to the mouse while it waits.  A frozen interface for eight
+        seconds would be a worse answer than no update check at all, and the
+        point of offering this at all is that the person chose to ask.
+
+        Nothing is downloaded, and nothing is written.  The only thing this can
+        produce is a version number to show and a page to open in a browser.
+        """
+
+        if self.controller.is_running:
+            # A download owns the engine and the progress bar.  Interleaving a
+            # check with it would fight over both, and the two questions have
+            # nothing to do with each other.
+            QMessageBox.information(
+                self,
+                "Already working",
+                "ClipDock is busy with another task. Check for updates when it has finished.",
+            )
+            return
+        self._set_busy(True, "Checking GitHub for a newer ClipDock…")
+        self._reset_progress_display()
+        self.status_bar.showMessage("Asking GitHub for the latest release…")
+
+        def operation(progress: Any, cancel_check: Any) -> Any:
+            return check_for_updates()
+
+        self.controller.start(operation)
+
+    def _report_update(self, result: UpdateCheck) -> None:
+        """Say what the check found.  The only action offered is opening a page."""
+
+        if result.available:
+            self.status_bar.showMessage(f"ClipDock {result.latest} is available.", 10000)
+            box = QMessageBox(self)
+            box.setWindowTitle("A newer ClipDock is available")
+            box.setIcon(QMessageBox.Icon.Information)
+            box.setTextFormat(Qt.TextFormat.RichText)
+            box.setText(
+                f"You are running ClipDock <b>{result.current}</b>.<br><br>"
+                f"<b>{result.latest}</b> has been published."
+            )
+            box.setInformativeText(
+                "ClipDock does not update itself, and it has not downloaded "
+                "anything. The release page lists what changed and what it "
+                "weighs; installing from there is your decision, not this "
+                "program's."
+            )
+            open_button = box.addButton(
+                "Open the release page", QMessageBox.ButtonRole.AcceptRole
+            )
+            box.addButton("Not now", QMessageBox.ButtonRole.RejectRole)
+            box.setDefaultButton(open_button)
+            box.exec()
+            if box.clickedButton() is open_button:
+                QDesktopServices.openUrl(QUrl(result.release_url))
+            return
+
+        if result.up_to_date:
+            self.status_bar.showMessage("ClipDock is up to date.", 6000)
+            box = QMessageBox(self)
+            box.setWindowTitle("ClipDock is up to date")
+            box.setIcon(QMessageBox.Icon.Information)
+            # Stated rather than left implicit: the check happened, and a reader
+            # who did not ask for it is entitled to know what it did.
+            box.setTextFormat(Qt.TextFormat.RichText)
+            box.setText(
+                f"ClipDock <b>{result.current}</b> is the latest published release.<br><br>"
+                "Nothing was downloaded."
+            )
+            box.exec()
+            return
+
+        self.status_bar.showMessage("Could not check for updates.", 8000)
+        box = QMessageBox(self)
+        box.setWindowTitle("Could not check for updates")
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setTextFormat(Qt.TextFormat.RichText)
+        box.setText(result.reason or "The check did not finish.")
+        box.setInformativeText(
+            f"You are running ClipDock {result.current}. The published releases are at "
+            f'<a href="{RELEASES_URL}">{RELEASES_URL}</a>.'
+        )
+        box.exec()
+
+    def _check_dependencies_again(self) -> None:
+        """Re-run the first-run check on demand, and say what it found either way.
+
+        The first run stays silent when everything is present, because a dialog
+        on every launch would make the program noisier the better behaved it was.
+        That is the right default and the wrong answer here, where the whole
+        point is that the user asked.
+        """
+
+        # Discovery is memoised, so a re-check has to forget the previous answer
+        # or it would report whatever the first run found.
+        forget_discovery()
+        try:
+            missing = missing_dependencies(find_ffmpeg)
+        except Exception as error:
+            get_logger().error("dependency_recheck_failed exception=%s", type(error).__name__)
+            QMessageBox.warning(
+                self,
+                "Could not check",
+                "ClipDock could not finish checking this computer. The application log has the detail.",
+            )
+            return
+        if not missing:
+            QMessageBox.information(
+                self,
+                "Everything ClipDock needs is here",
+                f"{checked_devices()}\n\nNothing needs downloading.",
+            )
+            return
+        # Modal, like the first-run one, because that is the same decision being
+        # made again and it deserves the same attention.
+        DependencyDialog(missing, self).exec()
+        # Installing may have resolved FFmpeg as a side effect, so the memoised
+        # search has to be dropped again or the engine keeps looking for it.
+        forget_discovery()
+        self.status_label.setText(
+            "FFmpeg is installed." if find_ffmpeg() else "FFmpeg was not installed."
+        )
+
+    def _remove_installed_ffmpeg(self) -> None:
+        """Remove the FFmpeg this application downloaded, and nothing else.
+
+        Only ClipDock's own copy is touched.  A copy belonging to something else
+        on the computer is found by the same device-wide search but is never
+        deleted - it is not ours to delete.
+        """
+
+        target = installed_ffmpeg()
+        if target is None:
+            QMessageBox.information(
+                self,
+                "Nothing to remove",
+                "ClipDock did not install FFmpeg on this computer, so there is nothing for it to remove. "
+                "Any FFmpeg here belongs to another program and is left alone.",
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Remove the FFmpeg ClipDock installed?",
+            f"This deletes:\n\n{target}\n\nand frees about {FFMPEG_INSTALLED_BYTES // 1_000_000} MB. "
+            "Video merging, MP3 conversion, and cover art will stop working until FFmpeg is available again. "
+            "FFmpeg installed by anything else is not touched.\n\nDelete it?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer is not QMessageBox.StandardButton.Yes:
+            return
+        if clear_cached_ffmpeg():
+            forget_discovery()
+            self.status_label.setText("Removed the FFmpeg ClipDock installed.")
+            QMessageBox.information(
+                self,
+                "Removed",
+                f"Deleted {target}. Use Check dependencies again to put it back.",
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "Could not remove it",
+                "ClipDock could not delete that file. Close anything that might be using it and try again.",
+            )
+
+    def _show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            f"About {APP_NAME}",
+            f"<b>{APP_NAME} {__version__}</b><br><br>"
+            "Downloads publicly accessible YouTube videos as MP4 or MP3, and saves "
+            "their captions.<br><br>"
+            f"yt-dlp {ytdlp_version() or 'version unavailable'}<br>"
+            "FFmpeg is the only thing this program ever downloads, and only after asking."
+            "<br><br>ClipDock does not update itself. Help - Check for ClipDock "
+            f"updates asks GitHub whether a newer release exists and shows you "
+            f'the page; it downloads nothing.<br><br><a href="{RELEASES_URL}">{RELEASES_URL}</a>'
+            "<br><br>MIT licensed. Not affiliated with YouTube.",
+        )
 
     @staticmethod
     def _window_button(parent: QWidget, glyph: str, tooltip: str) -> CaptionButton:
@@ -1125,6 +1365,26 @@ class MainWindow(QMainWindow):
             }}
             QPushButton#windowButtonClose:pressed {{
                 background: {caption.CLOSE_HOVER_PRESSED};
+            }}
+            /* Styled like a caption button rather than a form control: same
+               metrics, same full-height hover, no border and no resting fill.
+               The menu indicator is hidden because this opens a menu on press,
+               which is what a menu trigger does, and an arrow would suggest it
+               is a separate control with its own target. */
+            QPushButton#helpButton {{
+                background: transparent;
+                border: none;
+                border-radius: 0px;
+                color: {colors['muted']};
+                font-size: 13px;
+            }}
+            QPushButton#helpButton:hover {{
+                background: {colors['button_hover']};
+                color: {colors['text']};
+            }}
+            QPushButton#helpButton:menu-indicator {{
+                image: none;
+                width: 0px;
             }}
             QTableWidget#PlaylistTable,
             QTableWidget#QueueTable {{
@@ -2428,6 +2688,15 @@ class MainWindow(QMainWindow):
             self.controller.cancel()
 
     def _reset_progress_display(self, *, indeterminate: bool = True) -> None:
+        """Start the bar again for a new operation.
+
+        This has to run at the start of an operation rather than being left to
+        the previous one's completion.  Reading a video's details ends at 100%,
+        and the download that follows starts from nothing, so that 100% has to
+        be discarded here.  It stays discarded because `JobController` drops a
+        superseded worker's events, so nothing can re-assert it afterwards.
+        """
+
         self._progress_value = -1
         self.status_label.setToolTip("")
         if indeterminate:
@@ -2453,6 +2722,14 @@ class MainWindow(QMainWindow):
                 value = 0
             # A retried fragment can report a lower byte count.  Keeping the
             # displayed value monotonic prevents visible backwards jumps.
+            #
+            # This clamp is safe against a *previous operation's* value only
+            # because `JobController` never relays one: a worker that has been
+            # superseded is dropped at the source, so every event reaching here
+            # belongs to the operation `_reset_progress_display` last cleared
+            # for.  Without that, one leftover 100% from a finished probe would
+            # clamp every value of the download that followed it and pin the
+            # bar at 100% for the whole run.
             value = max(value, self._progress_value)
             if value != self.progress_bar.value():
                 self.progress_bar.setValue(value)
@@ -2544,6 +2821,17 @@ class MainWindow(QMainWindow):
             self.progress_bar.setValue(100)
             self._progress_value = 100
             self._apply_queue_results(result)
+            return
+
+        # Claimed before the DownloadResult branch below, which would otherwise
+        # treat a finished check as a finished download and report "Download
+        # complete" with no file to show.
+        if isinstance(result, UpdateCheck):
+            self._set_busy(False)
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
+            self._progress_value = 100
+            self._report_update(result)
             return
 
         self._set_busy(False, "Download complete")

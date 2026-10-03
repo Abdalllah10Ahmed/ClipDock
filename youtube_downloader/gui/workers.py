@@ -90,7 +90,9 @@ class JobController(QObject):
         self._worker = worker
 
         thread.started.connect(worker.run)
-        worker.progress.connect(self.progress)
+        # The worker is captured rather than recovered with QObject.sender(),
+        # which is not exposed to Python here and would raise NameError.
+        worker.progress.connect(lambda event, owner=worker: self._relay_progress(owner, event))
         worker.succeeded.connect(self._on_succeeded)
         worker.failed.connect(self._on_failed)
         worker.cancelled.connect(self._on_cancelled)
@@ -99,6 +101,21 @@ class JobController(QObject):
         worker.cancelled.connect(thread.quit)
         thread.finished.connect(self._on_thread_finished)
         thread.start()
+
+    def _relay_progress(self, owner: JobWorker, event: object) -> None:
+        """Forward a worker's progress, unless that worker has been superseded.
+
+        This runs in the emitting worker's thread, so by the time it is reached
+        ``self._worker`` is already the newer job if one has started.  Dropping
+        the event here is what stops the progress bar pinning itself: a value
+        from a finished operation that arrives after the next operation reset
+        the bar is not a retry reporting fewer bytes, and treating it as one
+        clamps every later value to 100.
+        """
+
+        if self._worker is not None and self._worker is not owner:
+            return
+        self.progress.emit(event)
 
     def cancel(self) -> None:
         if self._worker is not None:

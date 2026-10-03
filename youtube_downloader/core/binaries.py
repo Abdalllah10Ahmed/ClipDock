@@ -158,13 +158,14 @@ def require_ffmpeg(root: Path | None = None) -> Path:
     executable = find_ffmpeg(root)
     if executable is None:
         # Reached when a download needs FFmpeg and the first-run check either
-        # never ran or was declined.  It points at restarting the program, which
-        # is the only thing that actually re-runs the check - naming a menu item
-        # or a setup script that does not exist would send the user looking for
-        # something that is not there.
+        # never ran or was declined.  It points at the Help menu, which now
+        # exists: "Check dependencies again" re-runs the same offer without
+        # closing the program.  This message used to tell the reader to close
+        # and reopen ClipDock, which was true then and is a worse answer now that
+        # there is a button.
         raise DependencyError(
             "FFmpeg is required for video merging and MP3 conversion, but it is not "
-            "installed on this computer. Close and reopen ClipDock and accept the "
-            "offer to download it, then try again."
+            "installed on this computer. Open Help - Check dependencies again and "
+            "accept the offer to download it, then try again."
         )
     return executable

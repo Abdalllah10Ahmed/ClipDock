@@ -10,13 +10,16 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import PropertyMock, patch
 
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPalette, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QScrollArea
 
-from youtube_downloader.core.binaries import find_icon
+from youtube_downloader.core.binaries import find_icon, require_ffmpeg
+from youtube_downloader.core.errors import DependencyError
+from youtube_downloader.core.updates import UpdateCheck
 
 from youtube_downloader.core.models import (
     DownloadMode,
@@ -53,6 +56,7 @@ from youtube_downloader.gui.main_window import (
 )
 from youtube_downloader.gui.selectors import SelectorComboBox
 from youtube_downloader.gui.themes import DEFAULT_THEME, THEMES, theme_palette
+from youtube_downloader.gui.workers import JobWorker
 
 
 class FakeEngine:
@@ -161,6 +165,37 @@ class FakeEngine:
         if progress:
             progress(ProgressEvent("completed", 100.0, "Playlist complete"))
         return PlaylistDownloadResult(tuple(paths), len(paths), media=media)
+
+
+class ProgressReportingEngine:
+    """Wraps an engine so every operation reports progress the way the real one does.
+
+    `FakeEngine` returns instantly without emitting, which is right for testing
+    what the window does with a result and wrong for testing progress: with no
+    events there is no transition to watch.  This adds the events, paced with a
+    short sleep so the bar genuinely has to move between them.
+    """
+
+    def __init__(self, inner: object) -> None:
+        self._inner = inner
+        self.downloaded = False
+
+    def _paced(self, progress: object, percentages: tuple[float, ...], message: str) -> None:
+        if progress is None:
+            return
+        for percent in percentages:
+            progress(ProgressEvent("downloading", percent, message))
+            QTest.qWait(15)
+
+    def probe(self, url: str, *, progress=None, cancel_check=None):
+        self._paced(progress, (5.0, 40.0, 100.0), "Reading details")
+        return self._inner.probe(url, progress=progress, cancel_check=cancel_check)
+
+    def download(self, request: object, *, progress=None, cancel_check=None):
+        self.downloaded = True
+        self._paced(progress, (0.0, 8.0, 12.0, 47.0, 93.0), "Downloading media")
+        self._paced(progress, (100.0,), "Downloading media")
+        return self._inner.download(request, progress=progress, cancel_check=cancel_check)
 
 
 class GuiSmokeTests(unittest.TestCase):
@@ -378,6 +413,55 @@ class GuiSmokeTests(unittest.TestCase):
         window.close()
         self.app.processEvents()
 
+    def test_a_leftover_event_from_the_finished_probe_does_not_pin_the_download(self) -> None:
+        # The reported symptom: after *Fetch details* the bar sat at 100% and
+        # stayed there for the whole download.  Two operations drive one bar, and
+        # the probe's last value outliving its own operation was clamping every
+        # value of the download that followed.
+        window = MainWindow(FakeEngine())
+
+        # Operation one: reading details, which legitimately ends at 100%.
+        window._reset_progress_display()
+        window._on_progress(ProgressEvent("downloading", 100.0, "Details read"))
+        self.assertEqual(window.progress_bar.value(), 100)
+
+        # Operation two starts, so the bar is cleared and belongs to the download.
+        window._reset_progress_display()
+        self.assertEqual(window.progress_bar.maximum(), 0, "the new operation should show an indeterminate bar")
+
+        # A progress event from operation one arrives after operation two began.
+        # It goes through the controller, which is the only place that still
+        # knows which worker is current.
+        finished = JobWorker(lambda emit, cancel: None)
+        finished.progress.connect(
+            lambda event, owner=finished: window.controller._relay_progress(owner, event)
+        )
+        window.controller._worker = JobWorker(lambda emit, cancel: None)
+        finished._emit_progress(ProgressEvent("downloading", 100.0, "Leftover"))
+        self.app.processEvents()
+
+        # The download then reports its own progress, and the bar follows it.
+        window._on_progress(ProgressEvent("downloading", 12.0, "Downloading media"))
+        self.assertEqual(window.progress_bar.value(), 12)
+        window.close()
+        self.app.processEvents()
+
+    def test_progress_from_the_current_worker_still_reaches_the_bar(self) -> None:
+        # The guard above drops everything if it is written too eagerly, so the
+        # passing case is asserted rather than assumed.
+        window = MainWindow(FakeEngine())
+        window._reset_progress_display()
+        current = JobWorker(lambda emit, cancel: None)
+        current.progress.connect(
+            lambda event, owner=current: window.controller._relay_progress(owner, event)
+        )
+        window.controller._worker = current
+        current._emit_progress(ProgressEvent("downloading", 33.0, "Downloading media"))
+        self.app.processEvents()
+        self.assertEqual(window.progress_bar.value(), 33)
+        window.close()
+        self.app.processEvents()
+
     def test_download_job_reenables_controls_after_thread_finishes(self) -> None:
         window = MainWindow(FakeEngine())
         window.url_edit.setText("https://youtu.be/id")
@@ -391,6 +475,48 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertFalse(window.controller.is_running)
             self.assertTrue(window.download_button.isEnabled())
             self.assertTrue((Path(directory) / "downloaded.mp4").is_file())
+        window.close()
+
+    def test_the_real_handoff_between_two_operations_moves_the_bar(self) -> None:
+        # The recorded reason the earlier progress tests were not believed: they
+        # call `_on_progress` directly, so they exercise the clamp but never the
+        # transition.  This runs the two operations the way a person does - Fetch
+        # details, then Download - through the real window and the real
+        # controller, and watches the bar's `valueChanged` from a second thread
+        # while the second job runs.
+        #
+        # Without the reset reaching the bar, the probe's 100% is still in
+        # `_progress_value`, so the monotonic clamp in `_on_progress` pins the bar
+        # there and the download appears frozen.
+        engine = ProgressReportingEngine(FakeEngine())
+        window = MainWindow(engine)
+        window.url_edit.setText("https://youtu.be/id")
+        with tempfile.TemporaryDirectory() as directory:
+            window.destination_edit.setText(directory)
+
+            seen: list[int] = []
+            window.progress_bar.valueChanged.connect(seen.append)
+
+            window._fetch_details()
+            self._wait_for_job(window)
+            self.assertEqual(window.progress_bar.value(), 100, "the probe finished at 100%")
+
+            # Recorded from here on, so nothing the probe did can be mistaken for
+            # the download's own behaviour.
+            seen.clear()
+            window._start_download()
+            self.assertTrue(window.controller.is_running)
+            self._wait_for_job(window)
+
+            self.assertTrue(engine.downloaded, "the download did not run")
+            moved = sorted({value for value in seen if 0 < value < 100})
+            self.assertTrue(
+                moved,
+                f"the bar never moved during the download; it showed {seen}. "
+                "A probe that ended at 100% has pinned it.",
+            )
+            self.assertLess(max(moved), 100)
+            self.assertEqual(window.progress_bar.value(), 100)
         window.close()
 
     def test_subtitle_mode_offers_the_languages_the_video_advertises(self) -> None:
@@ -1013,6 +1139,129 @@ class GuiSmokeTests(unittest.TestCase):
                 brace = text.index("{", position)
                 return text[brace + 1 : text.index("}", brace)]
             offset = position + len(selector)
+
+    def test_help_offers_a_way_back_to_the_ffmpeg_offer(self) -> None:
+        # Declining the first-run prompt used to be close to a dead end: the check
+        # ran before the window existed and nothing else re-ran it, so the only
+        # recovery was to close and reopen the program.
+        window = MainWindow(FakeEngine())
+        try:
+            labels = [action.text() for action in window.help_button.menu().actions()]
+            self.assertIn("&Check dependencies again", labels)
+            self.assertIn("&Remove the FFmpeg ClipDock installed", labels)
+            self.assertIn("Check for ClipDock &updates", labels)
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_a_finished_update_check_is_not_reported_as_a_finished_download(self) -> None:
+        # Every job result lands in one handler, and its last branch assumes a
+        # DownloadResult.  An UpdateCheck reaching it would set the bar to 100%
+        # and say "Download complete" with no file behind it.
+        window = MainWindow(FakeEngine())
+        try:
+            reported: list[UpdateCheck] = []
+            window._report_update = reported.append
+            window._on_job_succeeded(
+                UpdateCheck(status="current", current="0.1.0", latest="v0.1.0")
+            )
+            self.assertEqual([result.status for result in reported], ["current"])
+            self.assertNotIn("Download complete", window.status_label.text())
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_update_check_is_refused_while_something_else_is_running(self) -> None:
+        # A download owns the engine and the progress bar; interleaving a check
+        # with it would fight over both for no reason.
+        window = MainWindow(FakeEngine())
+        try:
+            started: list[object] = []
+            window.controller.start = lambda operation: started.append(operation)
+            # is_running is derived from the thread, so it is a property and has
+            # to be replaced on the class rather than assigned on the instance.
+            with patch.object(
+                type(window.controller), "is_running", new_callable=PropertyMock, return_value=True
+            ), patch("youtube_downloader.gui.main_window.QMessageBox.information") as told:
+                window._check_for_updates()
+            self.assertEqual(started, [], "a check was started during a running job")
+            told.assert_called_once()
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_help_menu_sits_in_the_caption_strip(self) -> None:
+        # A native menu bar above a drawn caption would read as a second frame.
+        window = MainWindow(FakeEngine())
+        try:
+            self.assertEqual(window.help_button.objectName(), "helpButton")
+            # menuWidget() reports whether one was installed; menuBar() would
+            # *create* one to answer the question, which is the opposite of
+            # checking that the window did not ask for one.
+            self.assertIsNone(window.menuWidget())
+            self.assertEqual(window.help_button.height(), TITLE_BAR_HEIGHT)
+            self.assertTrue(
+                window.help_button.geometry().intersects(window.title_bar.geometry()),
+                "the Help trigger is not in the title bar it belongs to",
+            )
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_help_button_is_styled_like_a_caption_button(self) -> None:
+        window = MainWindow(FakeEngine())
+        try:
+            rule = self._rule_for(window.styleSheet(), "QPushButton#helpButton")
+            self.assertIn("background: transparent", rule)
+            self.assertIn("border: none", rule)
+            self.assertIn("border-radius: 0px", rule)
+            # The arrow is hidden because the button opens a menu on press, so an
+            # indicator would describe a control the user does not have to aim at.
+            self.assertIn("QPushButton#helpButton:menu-indicator", window.styleSheet())
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_removing_ffmpeg_is_offered_only_when_clipdock_installed_it(self) -> None:
+        # `clear_cached_ffmpeg()` had been written for this and called from
+        # nowhere.  It must stay limited to ClipDock's own copy: a copy on the
+        # device that belongs to something else is used, but is not ours to delete.
+        window = MainWindow(FakeEngine())
+        try:
+            action = window._remove_ffmpeg_action
+            with patch("youtube_downloader.gui.main_window.installed_ffmpeg", return_value=None):
+                window._refresh_help_menu()
+                self.assertFalse(action.isEnabled())
+            with patch(
+                "youtube_downloader.gui.main_window.installed_ffmpeg",
+                return_value=Path("C:/Program Files/ClipDock/ffmpeg.exe"),
+            ):
+                window._refresh_help_menu()
+                self.assertTrue(action.isEnabled())
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_missing_ffmpeg_message_points_at_the_menu_that_exists(self) -> None:
+        # The old text told the reader to close and reopen ClipDock, which was
+        # true when there was nothing to click.  A message naming a menu item
+        # that does not exist sends the user looking for something that is not
+        # there, so both are asserted here: the message names "Help", and the
+        # window built right there offers it.
+        with patch("youtube_downloader.core.binaries.find_ffmpeg", return_value=None):
+            with self.assertRaises(DependencyError) as context:
+                require_ffmpeg(Path("C:/nowhere"))
+        message = str(context.exception)
+        self.assertIn("Help", message)
+        self.assertNotIn("reopen", message.lower())
+
+        window = MainWindow(FakeEngine())
+        try:
+            labels = [action.text().lstrip("&") for action in window.help_button.menu().actions()]
+            self.assertIn("Check dependencies again", labels)
+        finally:
+            window.close()
+            self.app.processEvents()
 
     def test_the_scroll_bar_handle_is_a_rounded_pill_inside_its_groove(self) -> None:
         # A stock scroll bar is a solid block welded to its gutter with square

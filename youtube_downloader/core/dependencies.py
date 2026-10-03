@@ -496,6 +496,18 @@ def _ytdlp_version() -> str | None:
         return None
 
 
+def ytdlp_version() -> str | None:
+    """The version of the yt-dlp that shipped with this build.
+
+    Public because it is the one thing worth having in a bug report: when a
+    video stops working because an extractor changed, whether the bundled
+    yt-dlp is out of date is the first question, and the answer cannot be
+    guessed from the application's own version.
+    """
+
+    return _ytdlp_version()
+
+
 def missing_dependencies(find_ffmpeg: Callable[[], Path | None]) -> list[DependencyReport]:
     """Only what a download could actually supply.
 
