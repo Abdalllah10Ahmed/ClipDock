@@ -137,12 +137,29 @@ class FakeYdl:
             # A caption run writes one file per language and saves no media.
             # Real yt-dlp reports these under requested_subtitles, not in
             # requested_downloads, so the fake matches that shape exactly.
+            #
+            # It also honours writesubtitles / writeautomaticsub, because that
+            # is how real yt-dlp decides where to look.  Without this the fake
+            # wrote a file for every requested language whatever the flags
+            # said, which hid a real defect: a language YouTube advertises only
+            # as a machine translation, asked for under the default
+            # author-written-first source, produced a file in the test and
+            # nothing at all against YouTube.
             extension = self.options["subtitlesformat"]
             written = {}
+            allowed = []
+            if self.options.get("writesubtitles"):
+                allowed += sorted((self.caption_tracks.get("subtitles") or {}))
+            if self.options.get("writeautomaticsub"):
+                allowed += sorted((self.caption_tracks.get("automatic_captions") or {}))
             for index, language in enumerate(self.options["subtitleslangs"]):
                 if self.fail_after_subtitles and index >= self.fail_after_subtitles:
                     # YouTube stops answering partway through a long run.
                     raise RuntimeError("the caption endpoint stopped responding")
+                if language not in allowed:
+                    # No track of an enabled kind carries this language, so
+                    # yt-dlp writes nothing for it and says so at the end.
+                    continue
                 output = base.with_name(f"{base.name}.{language}.{extension}")
                 output.parent.mkdir(parents=True, exist_ok=True)
                 output.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
@@ -1033,6 +1050,118 @@ class EngineTests(unittest.TestCase):
             )
         self.assertEqual(FakeYdl.instances[-1].options["subtitleslangs"], ["en"])
         self.assertEqual(FakeYdl.instances[-1].options["sleep_interval_subtitles"], 0)
+
+    def test_a_language_offered_only_as_a_translation_is_still_written(self) -> None:
+        # "Author-written first" says it falls back to auto-generated captions
+        # when a language has no human track.  A real video advertises well over
+        # a hundred languages that exist only as machine translations, and
+        # picking one of those under the default source wrote nothing at all:
+        # yt-dlp was told to read author-written tracks only, found none for
+        # that language, and the run ended with "The requested SRT file was not
+        # produced" - which reads like a network fault and is not one.
+        info = self.engine.probe("https://youtu.be/video123")
+        self.assertNotIn("de", {t.language_code for t in info.manual_subtitle_tracks})
+        self.assertIn("de", {t.language_code for t in info.automatic_subtitle_tracks})
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                    subtitle_language="de",
+                )
+            )
+        options = FakeYdl.instances[-1].options
+        self.assertEqual(options["subtitleslangs"], ["de"])
+        self.assertFalse(options["writesubtitles"])
+        self.assertTrue(options["writeautomaticsub"])
+        self.assertEqual(len(result.subtitle_paths), 1)
+        self.assertEqual(result.subtitle_paths[0].suffix, ".srt")
+
+    def test_the_fallback_to_automatic_captions_is_actually_readable(self) -> None:
+        # The same promise, failing the other way round.  The language list falls
+        # back to the automatic codes when a video has no author-written track
+        # at all, so reading only author-written tracks meant the fallback
+        # selected languages the run was then forbidden to look for.
+        FakeYdl.caption_tracks = {
+            "subtitles": {},
+            "automatic_captions": {"es": [{"name": "Spanish (auto-generated)"}]},
+        }
+        info = self.engine.probe("https://youtu.be/video123")
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                )
+            )
+        options = FakeYdl.instances[-1].options
+        self.assertEqual(options["subtitleslangs"], ["es"])
+        self.assertTrue(options["writeautomaticsub"])
+        self.assertEqual(len(result.subtitle_paths), 1)
+
+    def test_an_author_written_language_is_still_preferred_over_its_translation(self) -> None:
+        # The fix must not turn the preference off: French is advertised under
+        # both headings on the fake video, and the human track is the reason the
+        # source is called "Author-written first".
+        info = self.engine.probe("https://youtu.be/video123")
+        self.assertIn("fr", {t.language_code for t in info.manual_subtitle_tracks})
+        with tempfile.TemporaryDirectory() as directory:
+            self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                    subtitle_language="fr",
+                )
+            )
+        options = FakeYdl.instances[-1].options
+        self.assertTrue(options["writesubtitles"])
+        self.assertFalse(options["writeautomaticsub"])
+
+    def test_a_deliberate_auto_source_is_not_overridden_for_a_hand_picked_language(self) -> None:
+        # Only the preference is resolved from what is advertised.  Someone who
+        # asked for the ASR track alone still gets it, even for a language that
+        # also has a human track.  English is the language advertised under both
+        # headings on the fake video, which is the only kind where the two
+        # readings could differ.
+        info = self.engine.probe("https://youtu.be/video123")
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                    subtitle_language="en",
+                    subtitle_source=SubtitleSource.AUTOMATIC,
+                )
+            )
+        options = FakeYdl.instances[-1].options
+        self.assertFalse(options["writesubtitles"])
+        self.assertTrue(options["writeautomaticsub"])
+        self.assertEqual(len(result.subtitle_paths), 1)
+
+    def test_the_all_source_still_writes_both_kinds_for_a_hand_picked_language(self) -> None:
+        info = self.engine.probe("https://youtu.be/video123")
+        with tempfile.TemporaryDirectory() as directory:
+            self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                    subtitle_language="fr",
+                    subtitle_source=SubtitleSource.ALL,
+                )
+            )
+        options = FakeYdl.instances[-1].options
+        self.assertTrue(options["writesubtitles"])
+        self.assertTrue(options["writeautomaticsub"])
 
     def test_a_refused_request_is_retried_with_a_delay(self) -> None:
         # Ten retries with no pause cannot outlast a rate limit, so the engine
