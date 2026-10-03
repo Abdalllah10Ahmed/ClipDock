@@ -13,7 +13,12 @@ Release artefacts are attached to GitHub Releases rather than committed. The
 installer for a release is `ClipDock-Setup.exe`; verify it against the SHA-256
 printed at the end of `scripts/build_installer.ps1`.
 
-## [Unreleased]
+## [0.2.0] - 2026-10-03
+
+Three fixes and three additions, all of which are about the program telling the
+truth about what it is doing. The Help menu is new, so the installer now offers a
+route back to the FFmpeg offer after you have declined it, and the update check
+tells you when a newer ClipDock exists without ever installing one.
 
 ### Fixed
 
@@ -76,5 +81,6 @@ First public release. Everything below is new.
 - No runtime dependency beyond PySide6 and yt-dlp; both are bundled. FFmpeg is
   the only thing ever downloaded, and only after asking.
 
-[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Abdalllah10Ahmed/ClipDock/releases/tag/v0.1.0

@@ -143,6 +143,36 @@ class InstallerScriptTests(unittest.TestCase):
 
         self.assertEqual(self.defines["ProductVersion"], __version__)
 
+    def test_the_installers_first_page_names_the_current_version(self) -> None:
+        """The installer's opening page states the version in prose.
+
+        This is a **fourth** copy of the version, and until this test existed it
+        was the only unguarded one: `__init__.py` and `clipdock.iss` have been
+        compared against each other, and the FFmpeg request's User-Agent is
+        interpolated and checked, but nothing looked at the sentence a person
+        reads *before deciding to install*.  A release built from a bumped
+        `__init__.py` would have shown `ClipDock 0.1.0` as the first thing on
+        screen while installing 0.2.0's code - and unlike a stale User-Agent,
+        which is invisible until someone reads a server log, this one is the most
+        visible surface the release has.
+
+        The check is that the version appears at all, rather than that it equals
+        `__version__`: the page opens with the product name, so the sentence has
+        to name the version in that position to be read as a version at all, and
+        requiring the full "ClipDock <version>" prefix keeps it from passing on
+        some unrelated number that happens to appear further down.
+        """
+
+        from youtube_downloader import __version__
+
+        body = INFO.read_text(encoding="utf-8")
+        opening = body.strip().splitlines()[0]
+        self.assertTrue(
+            opening.startswith(f"ClipDock {__version__}"),
+            f"the installer's first line is {opening!r}, which does not open with "
+            f"'ClipDock {__version__}'",
+        )
+
     def test_the_product_name_is_defined_once_and_used_everywhere(self) -> None:
         """One name, referenced through the preprocessor.
 

@@ -1,4 +1,4 @@
-ClipDock 0.1.0 - a desktop downloader for YouTube video, audio, and captions,
+ClipDock 0.2.0 - a desktop downloader for YouTube video, audio, and captions,
 written in Python with PySide6 and yt-dlp.
 
 
