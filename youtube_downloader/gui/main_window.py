@@ -276,15 +276,18 @@ class MainWindow(QMainWindow):
         # to agree, and a test checks that they do.
         self.title_bar_caption = caption_label
 
-        # A Help menu rather than a native menu bar.  The window is frameless
+        # An overflow menu rather than a native menu bar.  The window is frameless
         # with a drawn caption, so a menu bar above it would read as a second,
         # competing frame.  It sits in the caption strip instead, and carries the
         # only way back to the FFmpeg offer after it has been declined.
-        self.help_button = QPushButton("?", bar)
+        #
+        # A CaptionButton, so its mark is painted like the three beside it rather
+        # than being a character in the button's font: a "?" came out at three
+        # different weights against its neighbours, and a character the font
+        # lacks draws as a box.
+        self.help_button = CaptionButton(caption.OVERFLOW, "Help", bar)
         self.help_button.setObjectName("helpButton")
         self.help_button.setFixedSize(46, TITLE_BAR_HEIGHT)
-        self.help_button.setToolTip("Help")
-        self.help_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.help_button.setMenu(self._build_help_menu())
         layout.addWidget(self.help_button, 0)
 
@@ -1140,9 +1143,19 @@ class MainWindow(QMainWindow):
         return list(self.findChildren(SelectorComboBox))
 
     def _caption_buttons(self) -> list[CaptionButton]:
-        """The three window buttons, in the order they appear on the bar."""
+        """Every painted button on the bar, in the order they appear on it.
 
-        return [self.minimize_button, self.maximize_button, self.close_button]
+        The overflow trigger is included even though it is not a caption control
+        and never moves the window: its mark is painted the same way, so leaving
+        it out would leave it in the colour the theme happened to start with.
+        """
+
+        return [
+            self.help_button,
+            self.minimize_button,
+            self.maximize_button,
+            self.close_button,
+        ]
 
     def _apply_native_chrome(self, colors: dict[str, str]) -> None:
         """Tell Windows to round this window's corners and draw its border.
@@ -1368,19 +1381,22 @@ class MainWindow(QMainWindow):
             }}
             /* Styled like a caption button rather than a form control: same
                metrics, same full-height hover, no border and no resting fill.
-               The menu indicator is hidden because this opens a menu on press,
-               which is what a menu trigger does, and an arrow would suggest it
-               is a separate control with its own target. */
+               No colour and no font-size, because the mark is painted rather
+               than being text - `set_caption_colors` supplies it, the same as
+               the three window controls.  The menu indicator is hidden because
+               this opens a menu on press, which is what a menu trigger does,
+               and an arrow would suggest a separate control with its own
+               target. */
             QPushButton#helpButton {{
                 background: transparent;
                 border: none;
                 border-radius: 0px;
-                color: {colors['muted']};
-                font-size: 13px;
             }}
             QPushButton#helpButton:hover {{
                 background: {colors['button_hover']};
-                color: {colors['text']};
+            }}
+            QPushButton#helpButton:pressed {{
+                background: {colors['button_hover']};
             }}
             QPushButton#helpButton:menu-indicator {{
                 image: none;

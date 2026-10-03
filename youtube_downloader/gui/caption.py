@@ -1,4 +1,4 @@
-"""The three window buttons, drawn the way Windows draws them.
+"""The window's caption controls, drawn the way Windows draws them.
 
 A frameless window has to supply its own caption controls, and the first
 attempt styled them as three small rounded buttons with a border and a surface
@@ -20,6 +20,12 @@ platform:
 The buttons stay flat and square on purpose. What makes a window frame legible
 is that it is unchanged in every application, so anything decorative here is a
 cost.
+
+**The overflow glyph belongs here for the same reason the other three do.** It
+was a literal "?" in the button's font to begin with, and that is exactly the
+arrangement the second point argues against - worse here, because a character
+with no glyph in the font renders as a box, and this program's own screenshot
+tool has been bitten by an empty font database before.
 """
 
 from __future__ import annotations
@@ -36,6 +42,12 @@ MINIMIZE = "minimize"
 MAXIMIZE = "maximize"
 RESTORE = "restore"
 CLOSE = "close"
+# Three filled dots, the standard mark for "there are more commands here".
+# Chosen over a gear on purpose: a gear promises a preferences page, and this
+# menu is not one. Promising a setting that does not exist sends the reader
+# looking for it, which is the same defect as an error message naming a menu
+# item that was never added.
+OVERFLOW = "overflow"
 
 # Windows' own accent for the close button's hover, rather than a red picked to
 # suit a theme. A caption button that changes colour with the application's
@@ -56,6 +68,13 @@ _STROKE = 1.4
 
 # Half the width of the maximize square and the length of the minimize line.
 _HALF_GLYPH = 5.0
+
+# The three overflow dots: radius, and the gap between dot centres.  Sized
+# against _STROKE so they read at the same weight as the neighbouring lines - a
+# dot much under 1px disappears entirely at 100% scaling and a much larger one
+# looks like a different class of control sitting in the same strip.
+_DOT_RADIUS = 1.05
+_DOT_PITCH = 4.0
 
 
 class CaptionButton(QPushButton):
@@ -148,6 +167,8 @@ class CaptionButton(QPushButton):
                 self._draw_restore(painter, centre_x, centre_y)
             elif self._glyph == CLOSE:
                 self._draw_close(painter, centre_x, centre_y)
+            elif self._glyph == OVERFLOW:
+                self._draw_overflow(painter, centre_x, centre_y)
         finally:
             painter.end()
 
@@ -180,3 +201,24 @@ class CaptionButton(QPushButton):
         painter.drawLine(
             QPointF(centre_x + span, centre_y - span), QPointF(centre_x - span, centre_y + span)
         )
+
+    def _draw_overflow(self, painter: QPainter, centre_x: float, centre_y: float) -> None:
+        """Three filled dots on the vertical axis, filled rather than outlined.
+
+        Outlined dots at this radius collapse to a ring of one partially covered
+        pixel each, which reads as speckle.  Filled at this radius they are solid
+        marks, and the three of them share the optical centre of the cross and
+        the square beside them.
+
+        The colour comes from the painter's own pen rather than from a stored
+        field, so a dot cannot be left behind in the colour the button was built
+        with while the lines around it follow the theme.
+        """
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(painter.pen().color())
+        offsets = (-_DOT_PITCH, 0.0, _DOT_PITCH)
+        for offset in offsets:
+            painter.drawEllipse(
+                QPointF(centre_x, centre_y + offset), _DOT_RADIUS, _DOT_RADIUS
+            )

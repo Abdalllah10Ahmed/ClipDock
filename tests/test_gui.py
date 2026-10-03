@@ -1218,6 +1218,64 @@ class GuiSmokeTests(unittest.TestCase):
             # The arrow is hidden because the button opens a menu on press, so an
             # indicator would describe a control the user does not have to aim at.
             self.assertIn("QPushButton#helpButton:menu-indicator", window.styleSheet())
+            # No colour and no font-size, because there is no text for either to
+            # apply to.  A stylesheet that sets them is describing a glyph the
+            # button no longer has, which is how the painted "?" quietly stopped
+            # taking the theme's colour and became unreadable on one theme.
+            self.assertNotIn("font-size", rule)
+            self.assertNotIn("color", rule)
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_help_mark_is_painted_rather_than_typed(self) -> None:
+        # It was a literal "?" in the button's font.  `caption.py` argues against
+        # exactly that - a text glyph is laid out and baseline-aligned by the
+        # font, so it lands at a different weight from the three marks beside it -
+        # and a character the font lacks draws as a box, which this program's own
+        # screenshot tool has already been bitten by once.
+        window = MainWindow(FakeEngine())
+        try:
+            self.assertIsInstance(window.help_button, CaptionButton)
+            self.assertEqual(window.help_button.glyph(), caption.OVERFLOW)
+            self.assertEqual(window.help_button.text(), "")
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_help_mark_is_recoloured_by_every_theme(self) -> None:
+        # The mark is painted, so no stylesheet can colour it; `set_caption_colors`
+        # is the only thing that can.  Leaving the button out of that list is what
+        # would leave it in whatever colour the theme started with, and a mark at
+        # the wrong luminance is invisible rather than subtle - so all ten are
+        # checked, not the default.
+        window = MainWindow(FakeEngine())
+        window.show()
+        try:
+            for theme_id, _label, _description in THEMES:
+                with self.subTest(theme=theme_id):
+                    window._apply_theme(theme_id)
+                    self.app.processEvents()
+                    expected = theme_palette(theme_id)["text"].lower()
+                    for name in ("help_button", "minimize_button", "close_button"):
+                        with self.subTest(button=name):
+                            button = getattr(window, name)
+                            self.assertEqual(
+                                button._glyph_color.name().lower(),
+                                expected,
+                                f"the {name} mark is not the theme's text colour",
+                            )
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_help_button_is_in_the_list_of_painted_caption_buttons(self) -> None:
+        # Not a caption control - it never moves the window - but it is painted
+        # the same way, so it has to be told the theme with the others.
+        window = MainWindow(FakeEngine())
+        try:
+            self.assertIn(window.help_button, window._caption_buttons())
+            self.assertEqual(len(window._caption_buttons()), 4)
         finally:
             window.close()
             self.app.processEvents()

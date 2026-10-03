@@ -21,7 +21,7 @@ printed at the end of `scripts/build_installer.ps1`.
 
 ### Added
 
-- **A Help menu**, as a `?` trigger in the drawn caption strip rather than a native menu bar, which would read as a second frame above a frameless window's caption. It carries *Check dependencies again*, which is now the way back to the FFmpeg offer after declining it - previously that meant closing and reopening the program - and *Remove the FFmpeg ClipDock installed*, which limits itself to ClipDock's own copy and never deletes an FFmpeg that belongs to another program.
+- **A Help menu**, as a menu trigger in the drawn caption strip rather than a native menu bar, which would read as a second frame above a frameless window's caption. Its mark is three filled dots, not a character: a typed `?` is laid out and baseline-aligned by the font, so it sat at a different weight from the three window controls beside it, and a character the font happens to lack draws as a box. A gear was rejected on purpose - a gear promises a preferences page, and this menu is not one. (It also gives the button a real accessible name; a `?` was all a screen reader had to go on.) It carries *Check dependencies again*, which is now the way back to the FFmpeg offer after declining it - previously that meant closing and reopening the program - and *Remove the FFmpeg ClipDock installed*, which limits itself to ClipDock's own copy and never deletes an FFmpeg that belongs to another program.
 - **An update check for ClipDock itself.** It reports whether a newer release exists and links to the releases page. It does not download or install anything, and it is on demand rather than run at launch. `core/updates.py` has no download path at all, and a test pins its only two addresses.
 
 ### Changed
