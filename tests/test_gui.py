@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest.mock import PropertyMock, patch
 
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QColor, QIcon, QImage, QPalette, QWheelEvent
+from PySide6.QtGui import QColor, QIcon, QImage, QPalette, QPixmap, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QScrollArea
 
@@ -57,6 +57,13 @@ from youtube_downloader.gui.main_window import (
 from youtube_downloader.gui.selectors import SelectorComboBox
 from youtube_downloader.gui.themes import DEFAULT_THEME, THEMES, theme_palette
 from youtube_downloader.gui.workers import JobWorker
+
+# How far, per colour channel, a painted pixel may sit from the exact blend of a
+# backdrop and the colour it was drawn in, and still count as an antialiased
+# version of that colour.  Generous, because the rounding in an antialiased edge
+# is genuinely lossy - but two orders of magnitude below the 32-67 that a mark
+# painted in a third colour deviates by, so nothing is hiding in between.
+_BLEND_TOLERANCE = 6
 
 
 class FakeEngine:
@@ -1246,9 +1253,11 @@ class GuiSmokeTests(unittest.TestCase):
     def test_the_help_mark_is_recoloured_by_every_theme(self) -> None:
         # The mark is painted, so no stylesheet can colour it; `set_caption_colors`
         # is the only thing that can.  Leaving the button out of that list is what
-        # would leave it in whatever colour the theme started with, and a mark at
-        # the wrong luminance is invisible rather than subtle - so all ten are
-        # checked, not the default.
+        # would leave it in whatever colour the theme started with.
+        #
+        # This checks the colour the button was *told* to use, which is not the
+        # same question as the one that actually mattered - see
+        # test_the_help_mark_is_painted_in_the_theme_colour.
         window = MainWindow(FakeEngine())
         window.show()
         try:
@@ -1268,6 +1277,100 @@ class GuiSmokeTests(unittest.TestCase):
         finally:
             window.close()
             self.app.processEvents()
+
+    def test_the_help_mark_is_painted_in_the_theme_colour(self) -> None:
+        # The dot is drawn with the brush rather than a pen, so nothing about
+        # `_glyph_color` proves anything about what reaches the screen.  When the
+        # brush was filled from `painter.pen().color()` *after* `setPen(NoPen)`,
+        # every theme painted black - `setPen` does not switch the pen off, it
+        # installs a new pen carrying a default black - while `_glyph_color` was
+        # correct throughout and the test above passed in all ten themes.
+        #
+        # So this measures the pixels.  The button is rendered over an arbitrary
+        # colour no theme uses; at rest it paints no background of its own, so
+        # every pixel differing from that backdrop is the mark.  A mark painted in
+        # colour C and antialiased over B can only produce pixels on the line
+        # between B and C, so requiring every such pixel to be a blend of the
+        # backdrop and the theme's text colour accepts the right colour and
+        # rejects black with no threshold to tune.  Verified: the broken version
+        # deviates by 32-67 per channel and clamps its coverage to zero in eight
+        # of the ten themes, meaning the pixel points away from the theme colour
+        # entirely; the fixed version deviates by less than one.
+        backdrop = QColor("#123456")
+        window = MainWindow(FakeEngine())
+        window.show()
+        try:
+            for theme_id, _label, _description in THEMES:
+                with self.subTest(theme=theme_id):
+                    window._apply_theme(theme_id)
+                    self.app.processEvents()
+                    button = window.help_button
+                    text = QColor(button._glyph_color)
+                    self._assert_only_blends_of(
+                        button, backdrop, text, theme_id
+                    )
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def _assert_only_blends_of(
+        self,
+        button: object,
+        backdrop: QColor,
+        target: QColor,
+        label: str,
+    ) -> None:
+        """Every pixel the button painted is a blend of backdrop and target.
+
+        A stroke or a filled mark drawn in one colour and antialiased against a
+        flat background can only produce pixels on the straight line between the
+        two.  A mark painted in a third colour - black, most obviously - produces
+        pixels that do not lie on that line at all, whatever the theme's own
+        settings say.
+        """
+
+        canvas = QPixmap(button.size())
+        canvas.fill(backdrop)
+        button.render(canvas)
+        image = canvas.toImage()
+
+        span = [
+            target.red() - backdrop.red(),
+            target.green() - backdrop.green(),
+            target.blue() - backdrop.blue(),
+        ]
+        denominator = sum(component * component for component in span)
+        painted = 0
+        worst = 0
+        for y in range(image.height()):
+            for x in range(image.width()):
+                colour = image.pixelColor(x, y)
+                if colour == backdrop:
+                    continue
+                painted += 1
+                offset = [
+                    colour.red() - backdrop.red(),
+                    colour.green() - backdrop.green(),
+                    colour.blue() - backdrop.blue(),
+                ]
+                if denominator == 0:
+                    coverage = 0.0
+                else:
+                    coverage = sum(
+                        o * s for o, s in zip(offset, span)
+                    ) / denominator
+                    coverage = max(0.0, min(1.0, coverage))
+                for observed, step in zip(offset, span):
+                    worst = max(worst, abs(observed - coverage * step))
+
+        self.assertGreater(painted, 0, f"{label}: the help mark was not painted at all")
+        self.assertLessEqual(
+            worst,
+            _BLEND_TOLERANCE,
+            f"{label}: the help mark is painted in something other than the "
+            f"theme's own colour; a pixel is {worst} away from any blend of "
+            f"the backdrop and {target.name()}",
+        )
 
     def test_the_help_button_is_in_the_list_of_painted_caption_buttons(self) -> None:
         # Not a caption control - it never moves the window - but it is painted

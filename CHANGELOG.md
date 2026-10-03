@@ -17,6 +17,7 @@ printed at the end of `scripts/build_installer.ps1`.
 
 ### Fixed
 
+- **The Help menu's mark was painted black on every dark theme.** The three dots are filled with the brush rather than stroked, and the fill colour was read from the painter's pen *after* that pen had been replaced with `NoPen` — which does not switch a pen off, it installs a new one, and a new pen's colour is black by default. The dots now take the theme's colour like the three window controls beside them.
 - **The progress bar pinned itself at 100% after *Fetch details* and did not move during the download.** Two separate defects, both verified to fail without their fix. The probe's 100% was still in `_progress_value` when the download began, so the clamp that stops a retried fragment making the bar jump backward turned it into a permanent floor; the reset now happens at the start of every operation rather than being left to the previous one's completion. Separately, a superseded worker's progress events were still reaching the bar, and `JobController` now drops them.
 
 ### Added

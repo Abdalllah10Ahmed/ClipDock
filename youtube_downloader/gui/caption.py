@@ -210,13 +210,22 @@ class CaptionButton(QPushButton):
         marks, and the three of them share the optical centre of the cross and
         the square beside them.
 
-        The colour comes from the painter's own pen rather than from a stored
-        field, so a dot cannot be left behind in the colour the button was built
-        with while the lines around it follow the theme.
+        The colour is read from the painter's own pen, so a dot cannot be left
+        behind in the colour the button was built with while the lines around it
+        follow the theme.
+
+        **The pen's colour has to be taken before the pen is replaced**, which is
+        the whole of this method's subtlety.  ``setPen(NoPen)`` does not switch
+        the pen off; it installs a *new* pen that draws nothing, and a new pen
+        carries a default colour of black.  Asking for ``painter.pen().color()``
+        after that therefore returns black in every theme, and the dots came out
+        black on the dark ones while ``_glyph_color`` was demonstrably correct
+        the whole time.  Read the colour, *then* clear the pen.
         """
 
+        colour = painter.pen().color()
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(painter.pen().color())
+        painter.setBrush(colour)
         offsets = (-_DOT_PITCH, 0.0, _DOT_PITCH)
         for offset in offsets:
             painter.drawEllipse(
