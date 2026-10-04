@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+import urllib.error
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -143,6 +144,24 @@ class FakeYdl:
     # what real yt-dlp does when `overwrites` is off.
     reused_subtitles: list[str] = []
 
+    # Two distinguishable halves of one "file", so that a download which continued
+    # a part-written file can be told from one that started it over.  A single
+    # opaque blob cannot express that difference: both end up the same length.
+    MEDIA_FIRST_HALF = b"x" * 512
+    MEDIA_SECOND_HALF = b"y" * 512
+    # The refusal a media run fails with, on the same reasoning as
+    # `caption_failure_message`: the handling under test is specific to HTTP 429,
+    # and a paraphrase makes every failure look alike to it.
+    media_failure_message = ""
+    # How many media runs still have to fail, or None for "every run fails".
+    media_failures_remaining: int | None = None
+    # Media runs started, and what each was asked for.
+    media_runs = 0
+    media_concurrency: list[int] = []
+    media_continuedl: list[bool] = []
+    # Targets whose `.part` was continued rather than started over.
+    media_resumed: list[str] = []
+
     def __init__(self, options: dict) -> None:
         self.options = options
         self.downloaded = False
@@ -263,7 +282,46 @@ class FakeYdl:
         else:
             output = base.with_suffix(".mp3")
         output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_bytes(b"test-media")
+        cls = self.__class__
+        cls.media_runs += 1
+        # Read at the moment the run starts, for the same reason `caption_pacing`
+        # is: every attempt is handed the same options dictionary, so reading it
+        # afterwards would show the last value for all of them.
+        cls.media_concurrency.append(
+            int(self.options.get("concurrent_fragment_downloads") or 1)
+        )
+        cls.media_continuedl.append(bool(self.options.get("continuedl")))
+        # Whether a retry continues a part-written file or starts the file over is
+        # the whole question a media retry turns on, so the fake has to be able to
+        # say which happened.  Real yt-dlp opens an existing `.part` for append
+        # when `continuedl` is set and its state file vouches for the bytes, and
+        # truncates when it does not.  Modelled on the append side, because that
+        # is the side the engine is responsible for: it is what decides whether
+        # the part-written file is still there to be continued.
+        partial = output.with_name(output.name + ".part")
+        continuing = partial.exists() and bool(self.options.get("continuedl"))
+        if continuing:
+            cls.media_resumed.append(output.name)
+        if cls.media_failures_remaining is None:
+            refusing = False
+        elif cls.media_failures_remaining > 0:
+            cls.media_failures_remaining -= 1
+            refusing = True
+        else:
+            refusing = False
+        if refusing:
+            # A refusal leaves behind whatever had been written, which is the only
+            # reason a retry can continue instead of starting over.
+            partial.write_bytes(FakeYdl.MEDIA_FIRST_HALF)
+            raise RuntimeError(
+                cls.media_failure_message or "the media endpoint stopped responding"
+            )
+        if continuing:
+            with partial.open("ab") as handle:
+                handle.write(FakeYdl.MEDIA_SECOND_HALF)
+            partial.replace(output)
+        else:
+            output.write_bytes(FakeYdl.MEDIA_SECOND_HALF)
         return {
             "_type": "video",
             "id": "video123",
@@ -666,6 +724,12 @@ class FilenameTests(unittest.TestCase):
         FakeYdl.caption_runs = 0
         FakeYdl.caption_pacing = []
         FakeYdl.reused_subtitles = []
+        FakeYdl.media_failure_message = ""
+        FakeYdl.media_failures_remaining = None
+        FakeYdl.media_runs = 0
+        FakeYdl.media_concurrency = []
+        FakeYdl.media_continuedl = []
+        FakeYdl.media_resumed = []
         FakePlaylistYdl.instances.clear()
         FakePlaylistYdl.download_order.clear()
         self.engine = Engine(ydl_factory=FakeYdl, ffmpeg_path=Path("ffmpeg.exe"))
@@ -797,6 +861,12 @@ class EngineTests(unittest.TestCase):
         FakeYdl.caption_runs = 0
         FakeYdl.caption_pacing = []
         FakeYdl.reused_subtitles = []
+        FakeYdl.media_failure_message = ""
+        FakeYdl.media_failures_remaining = None
+        FakeYdl.media_runs = 0
+        FakeYdl.media_concurrency = []
+        FakeYdl.media_continuedl = []
+        FakeYdl.media_resumed = []
         FakeYdl.caption_tracks = {
             "subtitles": {"en": [{"name": "English"}], "fr": [{"name": "French"}]},
             "automatic_captions": {
@@ -1783,6 +1853,266 @@ class EngineTests(unittest.TestCase):
             )
         self.assertEqual(clock.slept, [], "a cancelled wait must not sleep through its delay")
         self.assertEqual(FakeYdl.caption_runs, 1)
+
+    def test_a_media_retry_continues_the_part_written_file_instead_of_starting_it_over(self) -> None:
+        # This is the question PROJECT_MAP records as unmeasured.  A media retry is
+        # only worth having if the part-written file the refused attempt left is
+        # still there to be finished, so the fake writes one distinguishable half,
+        # refuses, and can only produce a whole file by appending the other half
+        # to it.  A restart would be the same length and the same path -- the two
+        # are told apart by the bytes, which is the only way to tell them apart.
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.media_failure_message = RATE_LIMIT_TEXT
+        FakeYdl.media_failures_remaining = 1
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched():
+            result = self.engine.download_video(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.VIDEO,
+                    info=info,
+                    quality=info.qualities[-1],
+                )
+            )
+            self.assertEqual(
+                result.path.read_bytes(),
+                FakeYdl.MEDIA_FIRST_HALF + FakeYdl.MEDIA_SECOND_HALF,
+                "the retry must finish the file the refusal interrupted, not begin a new one",
+            )
+        self.assertEqual(FakeYdl.media_resumed, [result.path.name])
+        self.assertEqual(FakeYdl.media_continuedl, [True, True], "resume depends on continuedl staying on")
+
+    def test_a_throttled_media_request_is_waited_out_and_asked_again(self) -> None:
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.media_failure_message = RATE_LIMIT_TEXT
+        FakeYdl.media_failures_remaining = 1
+        clock = _FakeClock()
+        events: list[Any] = []
+        with tempfile.TemporaryDirectory() as directory, clock.patched():
+            result = self.engine.download_video(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.VIDEO,
+                    info=info,
+                    quality=info.qualities[-1],
+                ),
+                progress=events.append,
+            )
+            self.assertTrue(result.path.is_file())
+        self.assertEqual(FakeYdl.media_runs, 2)
+        waiting = [event for event in events if event.phase == "waiting"]
+        self.assertEqual(len(waiting), 1, "the wait has to be visible, not silent")
+        self.assertIsNone(waiting[0].percent, "an unknown percentage must not be reported as a number")
+        self.assertIn("60s", waiting[0].message)
+        self.assertIn("attempt 2 of 3", waiting[0].message)
+        self.assertAlmostEqual(clock.total_slept, 60.0, places=6)
+        self.assertTrue(
+            all(step <= 0.25 for step in clock.slept),
+            "the wait must sleep in short steps so a cancel is not held up",
+        )
+
+    def test_a_media_retry_asks_for_one_fragment_at_a_time(self) -> None:
+        # Four fragment requests at once is the most likely thing to be holding a
+        # limit open, so the retry asks for them one at a time -- and leaves them
+        # that way, because an item that needed one-at-a-time should keep it.
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.media_failure_message = RATE_LIMIT_TEXT
+        FakeYdl.media_failures_remaining = 1
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched():
+            self.engine.download_audio(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.AUDIO,
+                    info=info,
+                    audio_bitrate=128,
+                )
+            )
+        self.assertEqual(FakeYdl.media_concurrency, [4, 1])
+
+    def test_a_media_retry_waits_longer_than_the_backoff_that_already_ran(self) -> None:
+        # Eight fragment retries have already spent about two minutes of
+        # `_retry_backoff` by the time the application is told.  A ten-second wait
+        # would be asking for less than the service has already been asked for.
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.media_failure_message = RATE_LIMIT_TEXT
+        FakeYdl.media_failures_remaining = 99
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched(), self.assertRaises(
+            DownloadFailure
+        ) as context:
+            self.engine.download_video(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.VIDEO,
+                    info=info,
+                    quality=info.qualities[-1],
+                )
+            )
+        self.assertEqual(context.exception.code, "rate_limited")
+        self.assertIn("429", context.exception.message)
+        self.assertEqual(FakeYdl.media_runs, 3, "a throttled item must give up rather than loop")
+        self.assertAlmostEqual(clock.total_slept, 180.0, places=6)
+        self.assertGreater(
+            clock.total_slept,
+            sum(min(2.0**attempt, 30.0) for attempt in range(8)),
+        )
+
+    def test_a_media_failure_that_is_not_a_rate_limit_is_not_retried(self) -> None:
+        # Waiting out a refused format or a removed video would only delay the
+        # explanation the person needs.
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.media_failure_message = "Requested format is not available"
+        FakeYdl.media_failures_remaining = 99
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched(), self.assertRaises(
+            DownloadFailure
+        ) as context:
+            self.engine.download_video(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.VIDEO,
+                    info=info,
+                    quality=info.qualities[-1],
+                )
+            )
+        self.assertEqual(context.exception.code, "format_changed")
+        self.assertEqual(FakeYdl.media_runs, 1)
+        self.assertEqual(clock.slept, [])
+
+    def test_a_media_retry_stops_waiting_the_moment_it_is_cancelled(self) -> None:
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.media_failure_message = RATE_LIMIT_TEXT
+        FakeYdl.media_failures_remaining = 99
+        clock = _FakeClock()
+        announced: list[str] = []
+
+        def _cancel() -> bool:
+            # Cancelled as soon as the person has been told a wait is starting, and
+            # not before, so the first attempt really does run and really is
+            # refused.  A cancel that was true from the start would be caught by
+            # the first progress emit and prove nothing about the wait.
+            return any("slow down" in message for message in announced)
+
+        with tempfile.TemporaryDirectory() as directory, clock.patched(), self.assertRaises(
+            CancelledError
+        ):
+            self.engine.download_video(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.VIDEO,
+                    info=info,
+                    quality=info.qualities[-1],
+                ),
+                progress=lambda event: announced.append(event.message),
+                cancel_check=_cancel,
+            )
+        self.assertEqual(clock.slept, [], "a cancelled wait must not sleep through its delay")
+        self.assertEqual(FakeYdl.media_runs, 1)
+
+    def test_a_throttled_thumbnail_is_waited_out_and_asked_again(self) -> None:
+        info = self.engine.probe("https://youtu.be/video123")
+
+        class OneChunkResponse:
+            headers = {"Content-Length": "8", "Content-Type": "image/jpeg"}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def read(self, size: int) -> bytes:
+                if hasattr(self, "done"):
+                    return b""
+                self.done = True
+                return b"\xff\xd8\xffdata"
+
+        calls: list[Any] = []
+
+        def _urlopen(*args: Any, **kwargs: Any) -> Any:
+            calls.append(args)
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(
+                    "https://img.example/large.jpg", 429, "Too Many Requests", None, None
+                )
+            return OneChunkResponse()
+
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched(), patch(
+            "youtube_downloader.core.engine.urllib.request.urlopen", _urlopen
+        ):
+            result = self.engine.download_thumbnail(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.THUMBNAIL,
+                    info=info,
+                )
+            )
+            self.assertEqual(result.path.read_bytes(), b"\xff\xd8\xffdata")
+        self.assertEqual(len(calls), 2, "the refused request must be asked again")
+        self.assertAlmostEqual(clock.total_slept, 10.0, places=6)
+
+    def test_a_throttled_thumbnail_is_not_reported_as_a_broken_connection(self) -> None:
+        # The thumbnail branch catches `urllib.error.HTTPError` itself and used to
+        # answer every one of them with "check the connection", without ever asking
+        # the classifier -- the same wrong cause `2c4b456` fixed everywhere else and
+        # missed here.  Found by building the retry, not by looking for it.
+        info = self.engine.probe("https://youtu.be/video123")
+
+        def _urlopen(*args: Any, **kwargs: Any) -> Any:
+            raise urllib.error.HTTPError(
+                "https://img.example/large.jpg", 429, "Too Many Requests", None, None
+            )
+
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched(), patch(
+            "youtube_downloader.core.engine.urllib.request.urlopen", _urlopen
+        ), self.assertRaises(DownloadFailure) as context:
+            self.engine.download_thumbnail(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.THUMBNAIL,
+                    info=info,
+                )
+            )
+        self.assertEqual(context.exception.code, "rate_limited")
+        self.assertIn("429", context.exception.message)
+        # The message may name the connection -- it has to, to rule it out -- but
+        # it must not tell the person to go and check it, which is what the
+        # network message says and what this used to say for a 429.
+        self.assertNotIn("Check the connection", context.exception.message)
+
+    def test_a_thumbnail_failure_that_is_not_a_rate_limit_still_blames_the_network(self) -> None:
+        # The classifier must not swallow every thumbnail failure: a DNS failure is
+        # not a throttle and still gets the connection message.
+        info = self.engine.probe("https://youtu.be/video123")
+
+        def _urlopen(*args: Any, **kwargs: Any) -> Any:
+            raise urllib.error.URLError("Temporary failure in name resolution")
+
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched(), patch(
+            "youtube_downloader.core.engine.urllib.request.urlopen", _urlopen
+        ), self.assertRaises(DownloadFailure) as context:
+            self.engine.download_thumbnail(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.THUMBNAIL,
+                    info=info,
+                )
+            )
+        self.assertEqual(context.exception.code, "network_failure")
+        self.assertEqual(clock.slept, [], "a network fault is not worth waiting out")
 
     def test_a_caption_run_that_wrote_nothing_still_fails(self) -> None:
         FakeYdl.caption_tracks = {}
