@@ -22,7 +22,9 @@ from .errors import (
     ExtractionError,
     StorageError,
     UnsupportedContentError,
+    classify_yt_dlp_message,
     friendly_error,
+    rate_limited_failure,
     safe_log_error,
 )
 from .logging_setup import SafeYtDlpLogger, get_logger
@@ -170,6 +172,29 @@ CAPTION_RATE_LIMIT_WAITS = (10.0, 30.0)
 # was asked for.  Capped well below the wait between attempts: raising it to
 # match would make a long batch slower than simply trying again.
 CAPTION_RETRY_MAX_INTERVAL = 2.0
+
+# The same structural gap, one level up: a throttled *media* request is retried
+# no more than a throttled caption is, because it arrives on the same code path.
+# The waits cannot be the caption ones, and the reason is the one that makes this
+# worth doing at all: by the time the application is told, `fragment_retries` has
+# already spent eight attempts and roughly two minutes of `_retry_backoff`
+# (1+2+4+8+16+30+30+30).  Waiting ten seconds then would be asking for less than
+# the service has already been asked for, which is not a retry.  Bounded for the
+# same reason as the captions, and generous because one item of a several-hundred-
+# megabyte video is worth minutes of waiting.
+MEDIA_RATE_LIMIT_WAITS = (60.0, 120.0)
+
+# Fragment requests go out four at a time (`concurrent_fragment_downloads`), which
+# is the most likely thing to be holding a limit open in the first place.  A retry
+# asks for them one at a time.  This is the media counterpart of raising
+# `sleep_interval_subtitles`, and it is not reset afterwards: an item that needed
+# one-at-a-time should keep it for the rest of the run.
+MEDIA_RETRY_CONCURRENCY = 1
+
+# A thumbnail is the cheapest request the application makes and the only one with
+# no retry at all -- the engine fetches it itself with one `urllib.request.urlopen`
+# and a 30s timeout, so yt-dlp's fragment retries never applied to it either.
+THUMBNAIL_RATE_LIMIT_WAITS = (10.0, 30.0)
 
 # Share of one item's slice of the progress bar spent reading its details.
 # Reading takes seconds and saving takes minutes, so the bar has to be told
@@ -434,9 +459,19 @@ class Engine:
             "retries": 5,
             "fragment_retries": 8,
             "file_access_retries": 3,
-            # Without a delay, yt-dlp spends its whole retry budget in a few
-            # milliseconds, which cannot outlast a rate limit.  Backing off
-            # turns "too many requests" into a slow success.
+            # The two keys below are not interchangeable, and an earlier
+            # version of this comment said they were.  Only `fragment` ever sees
+            # a rate limit: `FragmentFD` catches `HTTPError` outright and retries
+            # it (`fragment.py:465-467`), so this genuinely does turn "too many
+            # requests" into a slow success -- `fragment_retries` attempts and
+            # about two minutes of waiting before it gives up.  `http` cannot:
+            # `HttpFD` re-raises any status outside 500-599 without wrapping it
+            # in `RetryDownload` (`http.py:185-187`), so a 429 never reaches
+            # this key at all and it fires only for the `TransportError` that
+            # `http.py:191-192` does wrap -- a dropped or reset connection, for
+            # which the delay is still worth having.  Anything relying on a 429
+            # being retried for media has to do it in the application; see
+            # `MEDIA_RATE_LIMIT_WAITS`.
             "retry_sleep_functions": {
                 "http": _retry_backoff,
                 "fragment": _retry_backoff,
@@ -904,7 +939,7 @@ class Engine:
                     f"again (attempt {attempt + 1} of {len(CAPTION_RATE_LIMIT_WAITS) + 1})",
                     force=True,
                 )
-                self._wait_before_caption_retry(wait, relay)
+                self._wait_before_retry(wait, relay)
                 interval = min(
                     CAPTION_REQUEST_INTERVAL * (2**attempt), CAPTION_RETRY_MAX_INTERVAL
                 )
@@ -912,7 +947,7 @@ class Engine:
                 self._logger.info("subtitles_pacing_raised seconds=%.1f", interval)
 
     @staticmethod
-    def _wait_before_caption_retry(wait_seconds: float, relay: _ProgressRelay) -> None:
+    def _wait_before_retry(wait_seconds: float, relay: _ProgressRelay) -> None:
         """Sleep in short steps so a cancel during the wait is immediate."""
         deadline = time.monotonic() + wait_seconds
         while True:
@@ -921,6 +956,67 @@ class Engine:
                 return
             relay.check_cancelled()
             time.sleep(min(0.25, remaining))
+
+    def _download_media(
+        self,
+        request: DownloadRequest,
+        options: dict[str, Any],
+        relay: _ProgressRelay,
+        expected_extension: str,
+        *,
+        extra_postprocessors: tuple[Any, ...] = (),
+    ) -> DownloadResult:
+        """Run a media download, waiting out a rate limit when one arrives.
+
+        Only a rate limit is retried, for the same reason captions only retry one:
+        waiting out a refused format, a removed video or a failed extract would
+        only delay the explanation the person needs.
+
+        A retry re-runs the same request rather than starting a new one, and the
+        engine's part in that is that it **touches nothing between attempts** --
+        no cleanup, no `overwrites`, and `continuedl` left on -- so the `.part`
+        file the refused attempt was part-way through is still there to be
+        finished.  Nothing here decides whether yt-dlp then continues it or starts
+        it over; that is its own business, and it is not established from here.
+
+        The progress bar is deliberately not reset between attempts.  Its clamp is
+        monotonic so a retried fragment cannot make it jump backwards, and a
+        resume reports a *higher* percentage than the attempt it replaces, so the
+        correct reading of "the bar did not move for a minute" is "it is waiting".
+        """
+        attempt = 0
+        while True:
+            try:
+                return self._download_with_ydl(
+                    request,
+                    options,
+                    relay,
+                    expected_extension,
+                    extra_postprocessors=extra_postprocessors,
+                )
+            except DownloadFailure as error:
+                if error.code != "rate_limited" or attempt >= len(MEDIA_RATE_LIMIT_WAITS):
+                    raise
+                wait = MEDIA_RATE_LIMIT_WAITS[attempt]
+                attempt += 1
+                self._logger.info(
+                    "media_rate_limited attempt=%d of=%d wait_seconds=%.0f",
+                    attempt + 1,
+                    len(MEDIA_RATE_LIMIT_WAITS) + 1,
+                    wait,
+                )
+                relay.emit(
+                    "waiting",
+                    None,
+                    f"YouTube asked us to slow down - waiting {int(wait)}s before trying "
+                    f"again (attempt {attempt + 1} of {len(MEDIA_RATE_LIMIT_WAITS) + 1})",
+                    force=True,
+                )
+                self._wait_before_retry(wait, relay)
+                options["concurrent_fragment_downloads"] = MEDIA_RETRY_CONCURRENCY
+                self._logger.info(
+                    "media_concurrency_lowered fragments=%d", MEDIA_RETRY_CONCURRENCY
+                )
 
     def _build_playlist_info(
         self,
@@ -1653,7 +1749,7 @@ class Engine:
                 },
             }
         )
-        result = self._download_with_ydl(request, options, relay, ".mp4")
+        result = self._download_media(request, options, relay, ".mp4")
         self._logger.info("download_completed mode=video")
         return result
 
@@ -1708,7 +1804,7 @@ class Engine:
                 }
             )
             extra_pps = ()
-        result = self._download_with_ydl(
+        result = self._download_media(
             request,
             options,
             relay,
@@ -1726,11 +1822,42 @@ class Engine:
         cancel_check: CancelCheck | None = None,
     ) -> DownloadResult:
         relay = _ProgressRelay(progress, cancel_check)
-        output_dir = self._prepare_output_dir(request.output_dir)
         if not request.info.thumbnail_url:
             raise ExtractionError("YouTube did not provide a thumbnail for this video.", code="thumbnail_missing")
         relay.emit("starting", 0.0, "Preparing thumbnail download", force=True)
         self._logger.info("download_started mode=thumbnail")
+        # A thumbnail is the one download the engine fetches itself, so it is also
+        # the only one that never had yt-dlp's retry machinery at all -- not even
+        # the fragment retries, which never applied to it.  One attempt with a 30s
+        # timeout was the whole of it.  The waits match the captions' rather than
+        # the media's because the request is one small file: there is nothing to
+        # be patient about here, only something to ask again for.
+        attempt = 0
+        while True:
+            try:
+                return self._write_thumbnail(request, relay)
+            except DownloadFailure as error:
+                if error.code != "rate_limited" or attempt >= len(THUMBNAIL_RATE_LIMIT_WAITS):
+                    raise
+                wait = THUMBNAIL_RATE_LIMIT_WAITS[attempt]
+                attempt += 1
+                self._logger.info(
+                    "thumbnail_rate_limited attempt=%d of=%d wait_seconds=%.0f",
+                    attempt + 1,
+                    len(THUMBNAIL_RATE_LIMIT_WAITS) + 1,
+                    wait,
+                )
+                relay.emit(
+                    "waiting",
+                    None,
+                    f"YouTube asked us to slow down - waiting {int(wait)}s before trying "
+                    f"again (attempt {attempt + 1} of {len(THUMBNAIL_RATE_LIMIT_WAITS) + 1})",
+                    force=True,
+                )
+                self._wait_before_retry(wait, relay)
+
+    def _write_thumbnail(self, request: DownloadRequest, relay: _ProgressRelay) -> DownloadResult:
+        output_dir = self._prepare_output_dir(request.output_dir)
         request_data = urllib.request.Request(
             request.info.thumbnail_url,
             headers={"User-Agent": f"ClipDock/{__version__}"},
@@ -1785,6 +1912,15 @@ class Engine:
             raise
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as error:
             safe_log_error(self._logger, error, operation="thumbnail")
+            # Classified before the network message rather than after it: this
+            # branch exists because `URLError` is an `OSError`, and handing one to
+            # `friendly_error` unchecked lands on "the file could not be written",
+            # which is not what a failed request means.  A 429 arriving here was
+            # being reported as "check the connection" -- the same wrong cause
+            # `2c4b456` fixed everywhere else and missed here, because this branch
+            # never called the classifier at all.
+            if classify_yt_dlp_message(f"{error} {error.__class__.__name__}") == "rate_limited":
+                raise rate_limited_failure() from error
             raise DownloadFailure("The thumbnail could not be downloaded because the network request failed. Check the connection and try again.", code="network_failure") from error
         except OSError as error:
             safe_log_error(self._logger, error, operation="thumbnail")

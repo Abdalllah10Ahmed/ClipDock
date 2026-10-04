@@ -85,6 +85,24 @@ def classify_yt_dlp_message(message: str) -> str:
     return "unrecognised"
 
 
+def rate_limited_failure() -> DownloadFailure:
+    """The one rate-limit explanation, built once so it cannot drift apart.
+
+    A caller that catches an HTTP error itself -- the thumbnail fetch does, and
+    has to, because it must not let an ``OSError`` subclass fall through to the
+    "the file could not be written" branch -- would otherwise have to restate this
+    to avoid reporting a 429 as a broken connection.  Two copies of this string
+    would be the same defect as the one it fixes.
+    """
+
+    return DownloadFailure(
+        "YouTube refused the request because too many were sent too quickly (HTTP 429). "
+        "That is a limit on the service rather than a problem with your connection; "
+        "wait a few minutes and try again. A long caption batch is the usual cause.",
+        code="rate_limited",
+    )
+
+
 def friendly_error(error: BaseException) -> AppError:
     if isinstance(error, AppError):
         return error
@@ -98,12 +116,7 @@ def friendly_error(error: BaseException) -> AppError:
     # not a fault in the person's connection, so it is named before the network
     # branch below rather than being counted with it.
     if classify_yt_dlp_message(text) == "rate_limited":
-        return DownloadFailure(
-            "YouTube refused the request because too many were sent too quickly (HTTP 429). "
-            "That is a limit on the service rather than a problem with your connection; "
-            "wait a few minutes and try again. A long caption batch is the usual cause.",
-            code="rate_limited",
-        )
+        return rate_limited_failure()
     if "no space left" in text or "disk full" in text or "not enough space" in text:
         return StorageError("The drive is full. Free some space and try again.")
     if isinstance(error, OSError) and error.errno == errno.ENOSPC:
