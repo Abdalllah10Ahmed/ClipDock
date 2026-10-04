@@ -323,8 +323,12 @@ class FakeStreamYdl:
 
     The 1080p group holds a bloated HLS variant, a lean progressive MP4, and a
     WebM/VP9 stream.  The 2160p group holds a huge HLS variant and a VP9 stream
-    with no MP4 counterpart at all, which is the case that must not offer a
-    smaller file because saving it would mean re-encoding.
+    with no H.264 counterpart at all, which is the case that must not offer a
+    smaller file.
+
+    Every alternative here is `ext: webm`, which is what let a false explanation
+    survive for so long - see `FakeMp4ContainerCodecYdl` for the shape this fake
+    cannot express and why that mattered.
     """
 
     instances: list["FakeStreamYdl"] = []
@@ -366,6 +370,76 @@ class FakeStreamYdl:
             "id": "streams",
             "title": "Stream comparison",
             "requested_downloads": [{"filepath": str(output)}],
+        }
+
+
+class FakeMp4ContainerCodecYdl:
+    """A video whose smaller streams are MP4 *containers* in a refused codec.
+
+    This fake exists because `FakeStreamYdl` could not represent the defect it
+    was standing in for, which is this project's recurring lesson for the
+    seventh time.  Every alternative in `FakeStreamYdl` is `ext: webm`, so the
+    window's claim that "the smaller streams at this resolution are WebM, and
+    converting those would mean re-encoding" was **true of the fake** - and false
+    of every real video measured.  Sprite Fright's 858p alternative is format
+    400: `ext=mp4`, `av01`, 104 MB.  It is an MP4 file.  Nothing about it needs
+    re-encoding; the only thing against it is the codec policy.
+
+    So the shape here is the real one: a smaller progressive stream with
+    `ext=mp4` and a VP9 or AV1 `vcodec`, at a resolution with no H.264
+    alternative at all.  Two groups, so the tests can tell "nothing smaller
+    exists" apart from "something smaller exists and is not being offered":
+
+      720p - the winner is HLS/VP9, and the only smaller stream is MP4/AV1, so
+             SMALLER_FILE is unavailable and the refusal must be explained.
+      480p - the winner is HLS/AV1 and a leaner H.264 MP4 exists, so the
+             smaller-file option IS offered and nothing is recorded as refused.
+    """
+
+    instances: list["FakeMp4ContainerCodecYdl"] = []
+
+    def __init__(self, options: dict) -> None:
+        self.options = options
+        self.__class__.instances.append(self)
+
+    def __enter__(self) -> "FakeMp4ContainerCodecYdl":
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        return None
+
+    def extract_info(self, url: str, download: bool = False):
+        if download:
+            raise AssertionError("these tests never download")
+        return {
+            "_type": "video",
+            "id": "mp4av",
+            "title": "MP4 container, refused codec",
+            "duration": 100,
+            "formats": [
+                # 1 MB of audio, so every video-only stream gains it on merge.
+                {"format_id": "audio", "vcodec": "none", "acodec": "mp4a",
+                 "ext": "m4a", "filesize": 1_000_000},
+                # 720p: bloated HLS/VP9 wins, and the only smaller stream is an
+                # MP4 container carrying AV1.  Not H.264, so not offered - but it
+                # is emphatically not WebM.
+                {"format_id": "hls-720", "ext": "m3u8", "vcodec": "vp09.00.50.08",
+                 "acodec": "none", "height": 720, "width": 1280, "fps": 24,
+                 "tbr": 4000, "filesize": 50_000_000},
+                {"format_id": "av1-720", "ext": "mp4", "vcodec": "av01.0.08M.08",
+                 "acodec": "none", "height": 720, "width": 1280, "fps": 24,
+                 "tbr": 2000, "filesize": 25_000_000},
+                {"format_id": "vp9-720", "ext": "mp4", "vcodec": "vp09.00.50.08",
+                 "acodec": "none", "height": 720, "width": 1280, "fps": 24,
+                 "tbr": 1800, "filesize": 22_000_000},
+                # 480p: a leaner H.264 MP4 exists, so this group does offer one.
+                {"format_id": "hls-480", "ext": "m3u8", "vcodec": "av01.0.08M.08",
+                 "acodec": "none", "height": 480, "width": 854, "fps": 24,
+                 "tbr": 2000, "filesize": 25_000_000},
+                {"format_id": "prog-480", "ext": "mp4", "vcodec": "avc1.4d401e",
+                 "acodec": "none", "height": 480, "width": 854, "fps": 24,
+                 "tbr": 1000, "filesize": 12_000_000},
+            ],
         }
 
 
@@ -923,9 +997,14 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(top.size_for_preference(StreamPreference.QUALITY), top.estimated_size_bytes)
         self.assertEqual(top.size_for_preference(StreamPreference.SMALLER_FILE), 26_000_000)
 
-        # 2160p: the only smaller stream is WebM/VP9, which would need a
-        # re-encode, so no alternative is offered and the smaller-file
-        # preference falls back to the ordinary stream and size.
+        # 2160p: no H.264 stream exists at all, so no alternative is offered and
+        # the smaller-file preference falls back to the ordinary stream and size.
+        #
+        # The comment this replaces said the smaller stream "is WebM/VP9, which
+        # would need a re-encode".  That is true of this fake and false of every
+        # real video measured, where the smaller stream is an MP4 container in a
+        # refused codec.  See FakeMp4ContainerCodecYdl, which exists to cover the
+        # shape this fake cannot express.
         ultra = by_height[2160]
         self.assertIsNone(ultra.smaller_format_id)
         self.assertFalse(ultra.has_smaller_alternative)
@@ -933,6 +1012,97 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(
             ultra.size_for_preference(StreamPreference.SMALLER_FILE),
             ultra.estimated_size_bytes,
+        )
+
+    def test_a_refused_smaller_stream_is_recorded_rather_than_discarded(self) -> None:
+        """An MP4 stream in a codec we do not offer must still be counted.
+
+        The window used to tell the user that such streams "are WebM, and
+        converting those would mean re-encoding".  That is false: they are MP4
+        containers, and nothing about them needs re-encoding - they are passed up
+        purely because of the codec policy.  Saying so truthfully requires
+        knowing what was passed up, so the engine records it instead of dropping
+        it.  The size is the whole finished file, video plus the audio track that
+        would be muxed in, which is the number a user is comparing against.
+        """
+
+        engine = Engine(
+            ydl_factory=FakeMp4ContainerCodecYdl, ffmpeg_path=Path("ffmpeg.exe")
+        )
+        info = engine.probe("https://youtu.be/mp4av")
+        by_height = {quality.height: quality for quality in info.qualities}
+        top = by_height[720]
+
+        # The bloated HLS variant still wins "best quality"; nothing about this
+        # changes which format is downloaded.
+        self.assertEqual(top.format_id, "hls-720")
+        self.assertFalse(top.has_smaller_alternative)
+        self.assertTrue(top.has_unoffered_smaller_alternative)
+        # The smallest MP4-container stream here is vp9-720: 22 MB of video plus
+        # the 1 MB audio track, so 23 MB against the winner's 51 MB.
+        self.assertEqual(top.unoffered_smaller_size_bytes, 23_000_000)
+        self.assertEqual(top.unoffered_smaller_codec, "vp9")
+
+    def test_the_smallest_refused_stream_is_the_one_recorded(self) -> None:
+        """Not merely that something was refused, but the *smallest* thing.
+
+        A message quoting the larger of two refused streams would understate the
+        saving and be wrong in a way that only shows up on the videos where both
+        exist - which is most of them.
+        """
+
+        engine = Engine(
+            ydl_factory=FakeMp4ContainerCodecYdl, ffmpeg_path=Path("ffmpeg.exe")
+        )
+        info = engine.probe("https://youtu.be/mp4av")
+        top = next(q for q in info.qualities if q.height == 720)
+
+        # av1-720 would have been 26 MB; vp9-720 is 23 MB and is the one recorded.
+        self.assertLess(top.unoffered_smaller_size_bytes or 0, 26_000_000)
+        self.assertEqual(top.unoffered_smaller_codec, "vp9")
+
+    def test_nothing_is_recorded_as_refused_where_a_smaller_file_is_offered(self) -> None:
+        """The absence of an explanation is only meaningful if it is earned.
+
+        480p has a leaner H.264 stream, so SMALLER_FILE applies and there is
+        nothing to explain. Recording a refusal here would put a misleading
+        sentence in the tooltip of an option that works perfectly well.
+        """
+
+        engine = Engine(
+            ydl_factory=FakeMp4ContainerCodecYdl, ffmpeg_path=Path("ffmpeg.exe")
+        )
+        info = engine.probe("https://youtu.be/mp4av")
+        by_height = {quality.height: quality for quality in info.qualities}
+        low = by_height[480]
+
+        self.assertEqual(low.format_id, "hls-480")
+        self.assertTrue(low.has_smaller_alternative)
+        self.assertEqual(low.smaller_format_id, "prog-480")
+        self.assertFalse(low.has_unoffered_smaller_alternative)
+        self.assertIsNone(low.unoffered_smaller_size_bytes)
+        self.assertIsNone(low.unoffered_smaller_codec)
+
+    def test_a_refusal_never_changes_which_format_is_downloaded(self) -> None:
+        """The codec policy is unchanged by any of this.
+
+        Recording a refused stream is a reporting change. If it could alter the
+        selection, the fix would have quietly widened what SMALLER_FILE offers -
+        which was explicitly not the decision. Both preferences must therefore
+        resolve to the same format at 720p.
+        """
+
+        engine = Engine(
+            ydl_factory=FakeMp4ContainerCodecYdl, ffmpeg_path=Path("ffmpeg.exe")
+        )
+        info = engine.probe("https://youtu.be/mp4av")
+        top = next(q for q in info.qualities if q.height == 720)
+
+        self.assertEqual(top.for_preference(StreamPreference.QUALITY), "hls-720")
+        self.assertEqual(top.for_preference(StreamPreference.SMALLER_FILE), "hls-720")
+        self.assertEqual(
+            top.size_for_preference(StreamPreference.SMALLER_FILE),
+            top.estimated_size_bytes,
         )
 
     def test_video_download_uses_the_selected_stream_preference(self) -> None:

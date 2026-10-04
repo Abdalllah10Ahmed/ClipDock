@@ -2112,14 +2112,57 @@ class MainWindow(QMainWindow):
             suffix = f" · ~{format_size(estimate)}" if estimate is not None else ""
             self.bitrate_combo.setItemText(index, f"{bitrate} kbps{suffix}")
 
-    def _sync_preference_availability(self) -> None:
-        """Offer "smaller file" only where a leaner MP4 stream really exists.
+    @staticmethod
+    def _why_no_smaller_file(quality: object) -> str:
+        """Explain, truthfully, why "smaller file" is unavailable here.
 
-        YouTube publishes a single usable stream at some resolutions, and at
-        1440p and 2160p the small streams it does publish are WebM, which the
-        app will not re-encode into MP4.  Offering the choice there would
-        quietly hand back the same file, so the entry is disabled and says
-        why instead of pretending to save something.
+        The message this replaces said the alternatives "are WebM, and converting
+        those would mean re-encoding".  That was wrong in every case measured.
+        Sprite Fright's 858p alternative is format 400, `ext=mp4`, `av01`,
+        104 MB; at 128p it is 394, `ext=mp4`, `av01`, 4 MB.  Both are MP4 files.
+        They need no re-encode and they are not WebM - the only thing against
+        them is that this app offers H.264, so a user was told a falsehood about
+        the very stream they were being offered instead.
+
+        So the reason names what was passed up and what it would have saved.  If
+        nothing smaller exists at all, it says only that, which is also true.
+
+        An unrecognised codec omits the word rather than interpolating it.  The
+        first draft fell back to "another codec" and read "YouTube has a smaller
+        another codec stream here" - a grammar bug, caught by a test written to
+        guard exactly this function.
+        """
+
+        unoffered = getattr(quality, "unoffered_smaller_size_bytes", None)
+        codec = getattr(quality, "unoffered_smaller_codec", None)
+        if not unoffered or unoffered <= 0:
+            return (
+                "YouTube offers only one H.264 stream at this resolution, so there "
+                "is nothing smaller to switch to."
+            )
+        codec_name = {
+            "vp9": "VP9",
+            "av1": "AV1",
+            "h264": "H.264",
+        }.get(str(codec or "").lower())
+        subject = f"a smaller {codec_name} stream" if codec_name else "a smaller stream"
+        return (
+            f"YouTube has {subject} here, about {format_size(unoffered)}, but this "
+            f"app only offers H.264, so it is not offered either."
+        )
+
+    def _sync_preference_availability(self) -> None:
+        """Offer "smaller file" only where a leaner H.264 stream really exists.
+
+        YouTube publishes a single H.264 stream at some resolutions, and at 1440p
+        and 2160p the smaller streams it does publish are usually VP9 or AV1,
+        which this app does not offer.  Offering the choice there would quietly
+        hand back the same file, so the entry is disabled and says why instead of
+        pretending to save something.
+
+        Those refused streams are frequently MP4 containers, not WebM, and they
+        need no re-encode - see `_why_no_smaller_file`, which exists because the
+        reason given here used to claim otherwise and was wrong.
 
         A batch queue is exempt: no link has been probed yet, and each one
         resolves its own preference when it is reached.
@@ -2146,17 +2189,16 @@ class MainWindow(QMainWindow):
             reason = (
                 StreamPreference.SMALLER_FILE.tradeoff
                 if available
-                else "YouTube offers only one MP4 stream here. The smaller streams at "
-                "this resolution are WebM, and converting those would mean "
-                "re-encoding, so they are not offered."
+                else self._why_no_smaller_file(quality)
             )
         item.setEnabled(available)
         item.setToolTip(reason)
         self.stream_preference_combo.setToolTip(
             f"Best quality: {StreamPreference.QUALITY.tradeoff}\n"
             f"Smaller file: {reason}\n\n"
-            "Smaller file never re-encodes, so VP9 and AV1 streams are not offered "
-            "even when their bitrate is lower."
+            "Smaller file never re-encodes, and it offers only H.264 in an MP4 "
+            "container, so a smaller VP9 or AV1 stream is passed up even when its "
+            "bitrate is lower."
         )
         if not available and self._selected_preference() is StreamPreference.SMALLER_FILE:
             # Falling back quietly would keep a stale choice in the request, so

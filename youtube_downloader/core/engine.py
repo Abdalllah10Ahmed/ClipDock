@@ -1041,6 +1041,25 @@ class Engine:
                     smaller_size_bytes=smaller_quality.estimated_size_bytes,
                     smaller_codec=smaller_family.value,
                 )
+            elif not quality.has_smaller_alternative:
+                # Nothing smaller is being offered.  If a smaller MP4 stream was
+                # refused only for its codec, carry its size and codec so the
+                # window can say what was passed up instead of misdescribing it.
+                unoffered = cls._smallest_unoffered_candidate(
+                    candidates,
+                    duration=duration,
+                    best_audio_size=best_audio_size,
+                    reference_size=quality.estimated_size_bytes,
+                )
+                if unoffered is not None:
+                    unoffered_quality, unoffered_family = unoffered
+                    quality = replace(
+                        quality,
+                        unoffered_smaller_size_bytes=(
+                            unoffered_quality.estimated_size_bytes
+                        ),
+                        unoffered_smaller_codec=unoffered_family.value,
+                    )
             result.append(quality)
         return sorted(result, key=lambda item: item.sort_key, reverse=True)
 
@@ -1091,6 +1110,55 @@ class Engine:
             if str(fmt.get("format_id") or "").strip() == exclude_format_id:
                 continue
             if not cls._is_mp4_h264(fmt):
+                continue
+            quality = cls._quality_from_format(fmt, index, duration, best_audio_size)
+            if quality is None:
+                continue
+            size = quality.estimated_size_bytes
+            if not size or size <= 0 or size >= reference_size:
+                continue
+            if best is None or size < (best[0].estimated_size_bytes or 0):
+                best = (quality, codec_family_of(str(fmt.get("vcodec") or "")))
+        return best
+
+    @classmethod
+    def _smallest_unoffered_candidate(
+        cls,
+        candidates: list[tuple[int, dict[str, Any]]],
+        *,
+        duration: float | None,
+        best_audio_size: int | None,
+        reference_size: int | None,
+    ) -> tuple[VideoQuality, VideoCodecFamily] | None:
+        """Smallest stream at this resolution refused *only* for its codec.
+
+        `_smallest_mp4_candidate` requires H.264, because that is the codec this
+        app offers.  A smaller MP4-container stream in VP9 or AV1 is skipped
+        there and used to be discarded entirely, which left the window claiming
+        the alternatives were WebM.  They are not: measured on Sprite Fright, the
+        refused alternative at 858p is format 400, `ext=mp4`, `av01`, 104 MB, and
+        at 128p it is 394, `ext=mp4`, `av01`, 4 MB.  Both are MP4 files needing no
+        re-encode; the only thing against them is the codec policy.
+
+        The size returned is the *finished* file - these formats are video-only,
+        so `_quality_from_format` adds the audio track that would be muxed in,
+        which is why 400 is quoted here as 104 MB and reaches the user as ~114 MB.
+        That is the number worth quoting: it is what a download would have cost.
+
+        So this finds them, purely so the absence can be explained with the size
+        that was passed up.  Nothing here is offered for download - the policy is
+        unchanged, and this function has no effect on which format is selected.
+        """
+
+        if not reference_size or reference_size <= 0:
+            return None
+        best: tuple[VideoQuality, VideoCodecFamily] | None = None
+        for index, fmt in candidates:
+            extension = str(fmt.get("ext") or "").strip().lower()
+            if extension not in {"mp4", "m4v"}:
+                continue
+            if cls._is_mp4_h264(fmt):
+                # Offered by _smallest_mp4_candidate, so not "unoffered".
                 continue
             quality = cls._quality_from_format(fmt, index, duration, best_audio_size)
             if quality is None:

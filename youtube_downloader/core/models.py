@@ -178,8 +178,10 @@ def estimate_audio_size_bytes(duration: float | None, bitrate: int | None) -> in
 class VideoCodecFamily(str, Enum):
     """Video codec families YouTube publishes, grouped by broad support.
 
-    The app always writes MP4, so picking a codec is also a question of whether
-    the stream can be placed in MP4 without a full re-encode.
+    The app always writes MP4, and it offers H.264 within it because that is what
+    players can be relied on to open.  Note that this is not a re-encode question:
+    YouTube serves VP9 and AV1 in MP4 containers too, so those could be placed in
+    an MP4 without transcoding.  They are passed up for decoder support alone.
     """
 
     H264 = "h264"
@@ -246,6 +248,14 @@ class VideoQuality:
     smaller_format_id: str | None = None
     smaller_size_bytes: int | None = None
     smaller_codec: str | None = None
+    # A smaller stream that exists at this resolution and is deliberately not
+    # offered, because it is not H.264.  Recorded rather than discarded so the
+    # window can say what was refused and what it would have saved.  It used to
+    # claim the alternatives were WebM, which was wrong for every case measured:
+    # Sprite Fright's 858p alternative is format 400, ext=mp4, av01, 104 MB - an
+    # MP4 file, refused for its codec and nothing else.
+    unoffered_smaller_size_bytes: int | None = None
+    unoffered_smaller_codec: str | None = None
 
     @property
     def size_label(self) -> str:
@@ -305,6 +315,19 @@ class VideoQuality:
         if size is None or size <= 0:
             return "size unavailable"
         return f"~{format_size(size)}"
+
+    @property
+    def has_unoffered_smaller_alternative(self) -> bool:
+        """Whether a smaller stream exists here that is not being offered.
+
+        Distinct from `has_smaller_alternative`, which asks whether one is
+        available *to* download.  This one exists so the window can explain an
+        absence truthfully rather than leaving the user to assume nothing was
+        there.
+        """
+
+        size = self.unoffered_smaller_size_bytes
+        return size is not None and size > 0
 
 
 @dataclass(frozen=True)
