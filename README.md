@@ -312,6 +312,6 @@ That does not extend to the components ClipDock bundles. PySide6 is **LGPL**, wh
 Patches are welcome. Two things matter more than style here:
 
 - **`requirements.txt` is pinned exactly and deliberately.** Two packages, no ranges. Adding a runtime dependency is a design decision, not a convenience — it changes what every recipient downloads and has to trust. Ask before adding one.
-- **Run the suite before sending a patch.** `.\.venv\Scripts\python.exe -m unittest discover -s tests`. It is 321 tests and takes twenty minutes or more on a slow machine, almost all of it in the headless GUI tests, which render and measure real pixels on every theme. Do not run two copies at once and expect either to finish quickly. A change that makes it slower or flakier is a change that needs explaining.
+- **Run the suite before sending a patch.** `.\.venv\Scripts\python.exe -m unittest discover -s tests`. It is 328 tests and takes twenty minutes or more on a slow machine, almost all of it in the headless GUI tests, which render and measure real pixels on every theme. Do not run two copies at once and expect either to finish quickly. A change that makes it slower or flakier is a change that needs explaining.
 
 Tests must never touch the real `%LOCALAPPDATA%`, `%ProgramData%`, `PATH`, or network. Several redirect all four deliberately; if you add a test that reads a real device setting, it will pass on your machine and fail on someone else's.

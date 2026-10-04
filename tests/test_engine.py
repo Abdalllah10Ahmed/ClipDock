@@ -21,6 +21,7 @@ from youtube_downloader.core.engine import (
     quality_matches_target,
     select_playlist_video_quality,
     select_playlist_videos,
+    unfinished_downloads,
 )
 from youtube_downloader.core.errors import CancelledError, DownloadFailure, ExtractionError, friendly_error
 from youtube_downloader.core.models import (
@@ -529,6 +530,122 @@ class FakeMp4ContainerCodecYdl:
             ],
         }
 
+
+class UnfinishedDownloadTests(unittest.TestCase):
+    """Detection of what an interrupted download actually leaves behind.
+
+    Built from the files a real interrupted Sprite Fright download left on disk,
+    because the shape of those names is the whole content of this feature: the
+    project map claimed the pieces went to `paths.temp`, and measurement showed
+    they go beside the target instead.
+    """
+
+    TARGET = "Sprite Fright - Blender Open Movie.f620.mp4"
+
+    def _interrupt(self, directory: str) -> Path:
+        """Recreate, exactly, what a killed download left in the output folder."""
+
+        folder = Path(directory)
+        (folder / f"{self.TARGET}.part").write_bytes(b"x" * 1024)
+        (folder / f"{self.TARGET}.part-Frag3.part").write_bytes(b"y" * 2_876_642)
+        (folder / f"{self.TARGET}.part-Frag10.part").write_bytes(b"z" * 512)
+        (folder / f"{self.TARGET}.ytdl").write_bytes(b"i" * 69)
+        return folder
+
+    def test_an_interrupted_download_is_found_beside_its_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = self._interrupt(directory)
+            found = unfinished_downloads(folder)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].target_name, self.TARGET)
+        self.assertEqual(
+            [part.name for part in found[0].parts],
+            [
+                f"{self.TARGET}.part",
+                f"{self.TARGET}.part-Frag10.part",
+                f"{self.TARGET}.part-Frag3.part",
+                f"{self.TARGET}.ytdl",
+            ],
+        )
+        self.assertEqual(found[0].total_bytes, 1024 + 2_876_642 + 512 + 69)
+        self.assertTrue(found[0].has_fragments)
+
+    def test_two_interrupted_downloads_are_reported_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "One.mp4.part").write_bytes(b"x" * 10)
+            (folder / "Two.mp4.part").write_bytes(b"y" * 20)
+            found = unfinished_downloads(folder)
+        self.assertEqual([item.target_name for item in found], ["One.mp4", "Two.mp4"])
+        self.assertEqual([item.total_bytes for item in found], [10, 20])
+
+    def test_a_finished_folder_has_nothing_to_resume(self) -> None:
+        # A finished download leaves no `.part`, so the button must stay off
+        # rather than offering to resume a file that is already complete.
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "Done.mp4").write_bytes(b"x" * 100)
+            (folder / "Done.en.srt").write_text("captions", encoding="utf-8")
+            (folder / "notes.txt").write_text("unrelated", encoding="utf-8")
+            self.assertEqual(unfinished_downloads(folder), ())
+
+    def test_a_lone_state_file_is_not_counted_as_progress(self) -> None:
+        # A `.ytdl` is a few dozen bytes of resume bookkeeping.  It says a run
+        # started; it is not downloaded media, and reporting its size as progress
+        # would be a number that means nothing.
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / f"{self.TARGET}.ytdl").write_bytes(b"i" * 69)
+            found = unfinished_downloads(folder)
+        self.assertEqual(len(found), 1)
+        self.assertFalse(found[0].has_fragments)
+        self.assertEqual(found[0].total_bytes, 69)
+
+    def test_a_missing_or_unreadable_folder_is_not_an_error(self) -> None:
+        # A folder that has been deleted or renamed between listing and looking
+        # must not take the window down with it, and must report nothing rather
+        # than claiming a resume that is not there.
+        self.assertEqual(unfinished_downloads(Path("no-such-folder-anywhere")), ())
+        with tempfile.TemporaryDirectory() as directory:
+            missing = Path(directory) / "gone"
+            self.assertEqual(unfinished_downloads(missing), ())
+
+    def test_a_piece_disappearing_between_listing_and_measuring_is_reported_as_unknown(self) -> None:
+        class VanishingPart:
+            """A listed entry whose ``stat`` fails, as a deleted or locked piece does."""
+
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def stat(self) -> Any:
+                raise PermissionError(32, "The process cannot access the file")
+
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / "Real.mp4.part").write_bytes(b"x" * 500)
+            original_iterdir = Path.iterdir
+
+            def _iterdir(self: Path) -> Any:
+                if self == folder:
+                    return iter([VanishingPart("Real.mp4.part"), Path(self) / "Real.mp4.ytdl"])
+                return original_iterdir(self)
+
+            with patch.object(Path, "iterdir", _iterdir):
+                found = unfinished_downloads(folder)
+        self.assertEqual(len(found), 1)
+        self.assertIsNone(found[0].total_bytes, "an unmeasured piece must not be summed as zero")
+
+    def test_the_parts_folder_is_not_where_an_interrupted_download_is_looked_for(self) -> None:
+        # The false premise, pinned.  `paths.temp` points at `.parts`, yt-dlp
+        # ignores it because the output template is absolute, and an interrupted
+        # run was measured leaving no such directory at all.  A `.parts` folder
+        # that happens to exist is therefore not treated as resumable content.
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            parts = folder / ".parts"
+            parts.mkdir()
+            (parts / "leftover.mp4.part").write_bytes(b"x" * 10)
+            self.assertEqual(unfinished_downloads(folder), ())
 
 class FilenameTests(unittest.TestCase):
     """Clean filenames by default, the video id only where one is actually needed.

@@ -8,7 +8,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import parse_qs, parse_qsl, urlencode, urlsplit, urlunsplit
 from typing import Any, Callable
@@ -54,6 +54,91 @@ from .models import (
 from .urls import UrlValidationError, normalize_youtube_playlist_url, normalize_youtube_url
 
 SUPPORTED_PLAYLIST_AUDIO_BITRATES = (128, 192, 256, 320)
+
+# An interrupted download leaves its unfinished pieces *beside the target*, not in
+# a `paths.temp` folder.  `paths` is inert for every download the engine runs:
+# yt-dlp warns "--paths is ignored since an absolute path is given in output
+# template" and raises that whenever `os.path.isabs(filename)`, and the engine
+# builds `outtmpl` from an absolute `output_dir` even though the template itself is
+# relative.  An interrupted Sprite Fright download left no `.parts` directory at
+# all -- it left `...f620.mp4.part`, `...f620.mp4.part-Frag3.part` and a 69-byte
+# `...f620.mp4.ytdl` next to where the finished file would go.  So this is where an
+# unfinished download actually is, and it is the only place worth looking.
+_FRAGMENT_PART = re.compile(r"^(?P<target>.+)\.part-Frag\d+\.part$", re.IGNORECASE)
+_STATE_FILE_SUFFIX = ".ytdl"
+_PART_SUFFIX = ".part"
+
+
+@dataclass(frozen=True)
+class UnfinishedDownload:
+    """A download that was interrupted, as the pieces it left behind.
+
+    ``target_name`` is the name the finished file will have, recovered by
+    stripping the marker suffix rather than by rebuilding the output template:
+    repeating the template's rules here is exactly how a clean filename silently
+    stopped being recognised once, when the video id it looked for was only in the
+    fallback template.
+
+    ``total_bytes`` is None rather than a partial sum when any piece could not be
+    measured, so a caller cannot report half a download's progress as if it were
+    all of it.
+    """
+
+    target_name: str
+    parts: tuple[Path, ...]
+    total_bytes: int | None
+
+    @property
+    def has_fragments(self) -> bool:
+        """True when real downloaded bytes are on disk, not only the state file.
+
+        A `.ytdl` file is a few dozen bytes of resume bookkeeping.  It is evidence
+        that a run started, not that there is anything to continue from, so it is
+        deliberately not counted as progress.
+        """
+
+        return any(part.name.lower().endswith(_PART_SUFFIX) for part in self.parts)
+
+
+def unfinished_downloads(output_dir: Path) -> tuple[UnfinishedDownload, ...]:
+    """Interrupted downloads found in ``output_dir``, oldest name first.
+
+    Nothing here opens, reads or deletes a piece: an interrupted run's ``.part``
+    file can still be locked while the application lives (a cancelled download
+    refused a cleanup with ``PermissionError: [WinError 32]``), so the folder is
+    only listed and every size is read defensively.
+    """
+
+    try:
+        entries = sorted(output_dir.iterdir(), key=lambda path: path.name.lower())
+    except OSError:
+        return ()
+    grouped: dict[str, list[Path]] = {}
+    for path in entries:
+        name = path.name
+        fragment = _FRAGMENT_PART.match(name)
+        if fragment is not None:
+            target = fragment.group("target")
+        elif name.lower().endswith(_PART_SUFFIX):
+            target = name[: -len(_PART_SUFFIX)]
+        elif name.lower().endswith(_STATE_FILE_SUFFIX):
+            target = name[: -len(_STATE_FILE_SUFFIX)]
+        else:
+            continue
+        grouped.setdefault(target, []).append(path)
+    found: list[UnfinishedDownload] = []
+    for target, parts in grouped.items():
+        total: int | None = 0
+        for part in parts:
+            try:
+                size = part.stat().st_size
+            except OSError:
+                total = None
+                break
+            if total is not None:
+                total += size
+        found.append(UnfinishedDownload(target_name=target, parts=tuple(parts), total_bytes=total))
+    return tuple(sorted(found, key=lambda item: item.target_name))
 
 # A queue entry is a single link, so these are the per-link media modes it can
 # run.  Playlist and queue are jobs in their own right and never nest.
