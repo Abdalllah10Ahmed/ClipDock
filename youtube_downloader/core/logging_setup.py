@@ -8,6 +8,8 @@ from logging.handlers import QueueHandler, QueueListener, RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
+from .errors import classify_yt_dlp_message
+
 
 @dataclass
 class LoggingHandle:
@@ -76,7 +78,17 @@ def get_logger() -> logging.Logger:
 
 
 class SafeYtDlpLogger:
-    """ yt-dlp logger that deliberately discards raw messages from the log file. """
+    """ yt-dlp logger that keeps a classified reason and discards the raw text.
+
+    yt-dlp messages carry video URLs, titles and file paths, so the text is
+    never written to the log -- that part is deliberate.  What was lost with it
+    was the *kind* of failure: a rate limit, a dropped connection and a removed
+    video all logged the same bare label, which is the one distinction a
+    throttled caption run needs in order to be diagnosable at all.  Each warning
+    and error is therefore reduced by :func:`~.errors.classify_yt_dlp_message`
+    to a single token from a closed vocabulary, which is the same decision made
+    for the user-facing message, so the two can never disagree.
+    """
 
     def __init__(self, logger: logging.Logger | None = None) -> None:
         self._logger = logger or get_logger()
@@ -88,7 +100,7 @@ class SafeYtDlpLogger:
         self._logger.info("yt_dlp_info")
 
     def warning(self, message: str) -> None:
-        self._logger.warning("yt_dlp_warning")
+        self._logger.warning("yt_dlp_warning reason=%s", classify_yt_dlp_message(message))
 
     def error(self, message: str) -> None:
-        self._logger.error("yt_dlp_error")
+        self._logger.error("yt_dlp_error reason=%s", classify_yt_dlp_message(message))

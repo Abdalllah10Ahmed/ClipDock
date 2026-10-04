@@ -68,6 +68,24 @@ _QUEUE_SUPPORTED_MODES = (
 # timedtext endpoint begins answering HTTP 429 partway through an unpaced run.
 CAPTION_REQUEST_INTERVAL = 0.6
 
+# yt-dlp cannot retry a throttled request at all, so the retry has to be here.
+# `downloader/http.py` re-raises any HTTP status below 500 without wrapping it in
+# RetryDownload, and the `RetryManager` loop re-raises anything that is not
+# retryable, so a 429 gets exactly zero attempts no matter what `"retries"` says
+# -- and `retry_sleep_functions` has no `subtitle` key to give one a longer wait
+# anyway.  The measured 3.9s, single-attempt refusal of the 25-language batch is
+# that behaviour working as written, not a missing option.
+#
+# These waits are the whole remedy, so they are deliberately bounded: a person
+# waiting a minute for captions is tolerable, a person waiting forever is not,
+# and a real block has to report rather than sit on the progress bar.
+CAPTION_RATE_LIMIT_WAITS = (10.0, 30.0)
+
+# Pacing is raised on each attempt, because the endpoint refused the pace that
+# was asked for.  Capped well below the wait between attempts: raising it to
+# match would make a long batch slower than simply trying again.
+CAPTION_RETRY_MAX_INTERVAL = 2.0
+
 # Share of one item's slice of the progress bar spent reading its details.
 # Reading takes seconds and saving takes minutes, so the bar has to be told
 # them apart: without the split, a probe that reports itself finished would
@@ -726,7 +744,7 @@ class Engine:
         # caption files it managed to write.
         already_there = self._folder_snapshot(output_dir)
         try:
-            return self._download_with_ydl(request, options, relay, request.subtitle_format.extension)
+            return self._download_captions(request, options, relay)
         except CancelledError:
             raise
         except DownloadFailure as error:
@@ -759,6 +777,65 @@ class Engine:
                     f"{len(languages)} caption files were saved."
                 ),
             )
+
+    def _download_captions(
+        self,
+        request: DownloadRequest,
+        options: dict[str, Any],
+        relay: _ProgressRelay,
+    ) -> DownloadResult:
+        """Run a caption download, waiting out a rate limit when one arrives.
+
+        Only a rate limit is retried.  Every other failure is reported on the
+        first attempt, because waiting out a refused format, a removed video or
+        a failed extract would only delay the explanation the person needs.
+
+        A retry re-runs the same request rather than resuming one, and that is
+        not a restart: `overwrites` is off, so yt-dlp reports every caption file
+        the earlier attempt already wrote as present and skips it.  Only the
+        languages it never got to are asked for again.
+        """
+        attempt = 0
+        while True:
+            try:
+                return self._download_with_ydl(
+                    request, options, relay, request.subtitle_format.extension
+                )
+            except DownloadFailure as error:
+                if error.code != "rate_limited" or attempt >= len(CAPTION_RATE_LIMIT_WAITS):
+                    raise
+                wait = CAPTION_RATE_LIMIT_WAITS[attempt]
+                attempt += 1
+                self._logger.info(
+                    "subtitles_rate_limited attempt=%d of=%d wait_seconds=%.0f",
+                    attempt + 1,
+                    len(CAPTION_RATE_LIMIT_WAITS) + 1,
+                    wait,
+                )
+                relay.emit(
+                    "waiting",
+                    None,
+                    f"YouTube asked us to slow down - waiting {int(wait)}s before trying "
+                    f"again (attempt {attempt + 1} of {len(CAPTION_RATE_LIMIT_WAITS) + 1})",
+                    force=True,
+                )
+                self._wait_before_caption_retry(wait, relay)
+                interval = min(
+                    CAPTION_REQUEST_INTERVAL * (2**attempt), CAPTION_RETRY_MAX_INTERVAL
+                )
+                options["sleep_interval_subtitles"] = interval
+                self._logger.info("subtitles_pacing_raised seconds=%.1f", interval)
+
+    @staticmethod
+    def _wait_before_caption_retry(wait_seconds: float, relay: _ProgressRelay) -> None:
+        """Sleep in short steps so a cancel during the wait is immediate."""
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            relay.check_cancelled()
+            time.sleep(min(0.25, remaining))
 
     def _build_playlist_info(
         self,
