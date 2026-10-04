@@ -48,6 +48,43 @@ def _exception_text(error: BaseException) -> str:
     return " ".join(str(error).lower().split())
 
 
+# Ordered: the first vocabulary whose tokens appear in the text wins, so the
+# narrow ones come before the broad ones.  This is a *diagnosis*, not a
+# message parser -- the tokens are the phrases that identify a cause with no
+# ambiguity, because the cost of guessing wrong here is telling the user to
+# check their connection when the service is refusing them.
+_YTDLP_REASON_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("rate_limited", ("too many requests", "http error 429", "429 client error", "http 429", "rate limit")),
+    ("private", ("private video", "this video is private", "sign in if you", "members-only")),
+    ("unavailable", ("video unavailable", "has been removed", "no longer available", "does not exist", "not available in your country")),
+    ("age_restricted", ("age-restricted", "age restricted", "confirm your age")),
+    ("live_event", ("live stream", "live event", "is a premiere", "premieres in")),
+    ("verification_required", ("sign in to confirm", "login required", "sign in required", "confirm you are not a bot", "confirm you're not a bot")),
+    ("cookies_required", ("use --cookies", "cookies from browser", "account cookies")),
+    ("format_unavailable", ("requested format is not available", "no video formats", "no formats found")),
+    ("extractor_failure", ("unable to download webpage", "failed to parse", "unsupported url", "no suitable extractor")),
+    ("network_failure", ("timed out", "timeout", "connection reset", "connection refused", "temporary failure in name resolution", "network is unreachable", "getaddrinfo", "ssl", "remote end closed", "service unavailable", "http error 5", "http error 503")),
+)
+
+
+def classify_yt_dlp_message(message: str) -> str:
+    """Reduce a yt-dlp message to one fixed token, or ``"unrecognised"``.
+
+    yt-dlp's own messages carry video URLs, titles and paths, which is why
+    :class:`~.logging_setup.SafeYtDlpLogger` never writes them out.  Discarding
+    the text alone leaves a log where a rate limit, a dropped connection and a
+    removed video all read ``yt_dlp_error``, which is the one diagnostic a
+    throttle needs.  Reducing to a token keeps the *kind* of failure while
+    dropping everything identifiable, so the vocabulary has to be a closed set
+    and every token has to be a phrase that identifies the cause on its own.
+    """
+    text = " ".join(message.lower().split())
+    for reason, tokens in _YTDLP_REASON_TOKENS:
+        if any(token in text for token in tokens):
+            return reason
+    return "unrecognised"
+
+
 def friendly_error(error: BaseException) -> AppError:
     if isinstance(error, AppError):
         return error
@@ -57,6 +94,16 @@ def friendly_error(error: BaseException) -> AppError:
     text = f"{_exception_text(error)} {error.__class__.__name__.lower()}"
     if re.search(r"\b(?:cancelled|canceled)\b", text):
         return CancelledError()
+    # A 429 is a decision the service made about how fast it is being asked,
+    # not a fault in the person's connection, so it is named before the network
+    # branch below rather than being counted with it.
+    if classify_yt_dlp_message(text) == "rate_limited":
+        return DownloadFailure(
+            "YouTube refused the request because too many were sent too quickly (HTTP 429). "
+            "That is a limit on the service rather than a problem with your connection; "
+            "wait a few minutes and try again. A long caption batch is the usual cause.",
+            code="rate_limited",
+        )
     if "no space left" in text or "disk full" in text or "not enough space" in text:
         return StorageError("The drive is full. Free some space and try again.")
     if isinstance(error, OSError) and error.errno == errno.ENOSPC:
@@ -97,7 +144,9 @@ def friendly_error(error: BaseException) -> AppError:
         return DownloadFailure("The selected quality is no longer available. Fetch the video details again and choose another option.", code="format_changed")
     if "unsupported url" in text or "no suitable extractor" in text:
         return ExtractionError("This link is not a supported YouTube video link.", code="unsupported_url")
-    if any(token in text for token in ("timed out", "timeout", "connection reset", "connection refused", "temporary failure", "network is unreachable", "getaddrinfo", "ssl", "remote end closed", "service unavailable", "http error 5", "http error 503", "http error 429")):
+    # The rate limit is deliberately absent here: it is classified above, so a
+    # 429 can no longer be reported as a broken connection.
+    if any(token in text for token in ("timed out", "timeout", "connection reset", "connection refused", "temporary failure", "network is unreachable", "getaddrinfo", "ssl", "remote end closed", "service unavailable", "http error 5", "http error 503")):
         return DownloadFailure("The network connection was interrupted or unavailable. Check the connection and try again; partial downloads may resume.", code="network_failure")
     if "unable to download webpage" in text or "failed to parse" in text or ("extract" in text and "failed" in text):
         return ExtractionError("YouTube could not be queried. The site or extractor may have changed; update the bundled yt-dlp dependency and try again.", code="extractor_changed")

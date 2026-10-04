@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -40,6 +42,45 @@ from youtube_downloader.core.models import (
 # Long enough to clear the engine's 0.10s progress throttle, so simulated hook
 # events are not all collapsed into the first one.
 _PROGRESS_TICK = 0.12
+
+# What YouTube actually answers when the caption endpoint has been asked for too
+# much.  Quoted verbatim rather than paraphrased, because the whole point of the
+# rate-limit path is that it recognises this text and no other.
+RATE_LIMIT_TEXT = (
+    "Unable to download video subtitles for 'de': HTTP Error 429: Too Many Requests"
+)
+
+
+class _FakeClock:
+    """A ``time`` stand-in where sleeping advances the clock instead of passing.
+
+    Waiting out a rate limit costs ten seconds and then thirty.  Patching only
+    ``sleep`` would leave that wait spinning against a real ``monotonic``, so
+    the two move together: every recorded sleep is added to the clock and the
+    wait finishes immediately.  The recorded sleeps are the assertion.
+    """
+
+    def __init__(self) -> None:
+        self.now = 10_000.0
+        self.slept: list[float] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.slept.append(seconds)
+        self.now += seconds
+
+    def monotonic(self) -> float:
+        return self.now
+
+    @property
+    def total_slept(self) -> float:
+        return sum(self.slept)
+
+    @contextmanager
+    def patched(self):
+        with patch("youtube_downloader.core.engine.time.sleep", self.sleep), patch(
+            "youtube_downloader.core.engine.time.monotonic", self.monotonic
+        ):
+            yield
 
 
 def expand_template(template: str, title: str, video_id: str, extension: str) -> str:
@@ -79,6 +120,27 @@ class FakeYdl:
     # When positive, a caption run writes this many languages and then fails,
     # which is what YouTube does once a multi-language run trips its rate limit.
     fail_after_subtitles = 0
+    # The text of that failure.  It has to be settable because the refusal the
+    # app now has to recognise is a *specific* one, and a fake whose message is
+    # a paraphrase cannot express it: every caption failure would look alike to
+    # the code under test, exactly as it does when only "the endpoint stopped
+    # responding" is ever raised.
+    caption_failure_message = ""
+    # How many caption runs still have to fail at `fail_after_subtitles`, or None
+    # for the older meaning "every run fails".  Each retry builds a new YoutubeDL,
+    # so a number here is how a test says "the endpoint cuts this run short, then
+    # serves the next one" -- the only shape in which "a retry asks only for what
+    # is missing" can be observed at all.
+    caption_failures_remaining: int | None = None
+    # Caption runs started, counted, so the number above can be spent down.
+    caption_runs = 0
+    # The pacing each caption run was asked for, in order, read at the moment
+    # the run starts.  The engine hands every run the same options dictionary,
+    # so reading it afterwards would show the last value for all of them.
+    caption_pacing: list[float] = []
+    # Languages a run reported as already present instead of fetching, which is
+    # what real yt-dlp does when `overwrites` is off.
+    reused_subtitles: list[str] = []
 
     def __init__(self, options: dict) -> None:
         self.options = options
@@ -152,17 +214,42 @@ class FakeYdl:
                 allowed += sorted((self.caption_tracks.get("subtitles") or {}))
             if self.options.get("writeautomaticsub"):
                 allowed += sorted((self.caption_tracks.get("automatic_captions") or {}))
+            cls = self.__class__
+            cls.caption_runs += 1
+            cls.caption_pacing.append(float(self.options.get("sleep_interval_subtitles") or 0.0))
+            if cls.caption_failures_remaining is None:
+                refusing = bool(cls.fail_after_subtitles)
+            elif cls.caption_failures_remaining > 0:
+                cls.caption_failures_remaining -= 1
+                refusing = True
+            else:
+                refusing = False
             for index, language in enumerate(self.options["subtitleslangs"]):
-                if self.fail_after_subtitles and index >= self.fail_after_subtitles:
-                    # YouTube stops answering partway through a long run.
-                    raise RuntimeError("the caption endpoint stopped responding")
+                if refusing and index >= self.fail_after_subtitles:
+                    # YouTube stops answering partway through a long run.  The
+                    # message is whatever the test set, so a run can be made to
+                    # fail the way the live endpoint fails -- which is the only
+                    # way to tell a rate limit from any other refusal.
+                    raise RuntimeError(
+                        cls.caption_failure_message or "the caption endpoint stopped responding"
+                    )
                 if language not in allowed:
                     # No track of an enabled kind carries this language, so
                     # yt-dlp writes nothing for it and says so at the end.
                     continue
                 output = base.with_name(f"{base.name}.{language}.{extension}")
                 output.parent.mkdir(parents=True, exist_ok=True)
-                output.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
+                if output.exists() and not self.options.get("overwrites", True):
+                    # Real yt-dlp checks for the file before asking for it and,
+                    # with `overwrites` off, reports the one it found as the
+                    # result for that language.  A retry therefore asks only for
+                    # the languages the refused attempt never reached, and the
+                    # result still counts every file the person now has.
+                    cls.reused_subtitles.append(language)
+                else:
+                    output.write_text(
+                        "1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8"
+                    )
                 written[language] = {"ext": extension, "filepath": str(output)}
             return {
                 "_type": "video",
@@ -457,6 +544,11 @@ class FilenameTests(unittest.TestCase):
     def setUp(self) -> None:
         FakeYdl.instances.clear()
         FakeYdl.fail_after_subtitles = 0
+        FakeYdl.caption_failure_message = ""
+        FakeYdl.caption_failures_remaining = None
+        FakeYdl.caption_runs = 0
+        FakeYdl.caption_pacing = []
+        FakeYdl.reused_subtitles = []
         FakePlaylistYdl.instances.clear()
         FakePlaylistYdl.download_order.clear()
         self.engine = Engine(ydl_factory=FakeYdl, ffmpeg_path=Path("ffmpeg.exe"))
@@ -583,6 +675,11 @@ class EngineTests(unittest.TestCase):
     def setUp(self) -> None:
         FakeYdl.instances.clear()
         FakeYdl.fail_after_subtitles = 0
+        FakeYdl.caption_failure_message = ""
+        FakeYdl.caption_failures_remaining = None
+        FakeYdl.caption_runs = 0
+        FakeYdl.caption_pacing = []
+        FakeYdl.reused_subtitles = []
         FakeYdl.caption_tracks = {
             "subtitles": {"en": [{"name": "English"}], "fr": [{"name": "French"}]},
             "automatic_captions": {
@@ -1425,6 +1522,150 @@ class EngineTests(unittest.TestCase):
             self.assertEqual(len(result.subtitle_paths), 2)
             self.assertTrue(all(path.is_file() for path in result.subtitle_paths))
         self.assertIn("2 of 3", result.warning)
+
+    def test_a_caption_run_cut_short_by_another_fault_is_not_retried(self) -> None:
+        # Only a rate limit is worth waiting for.  A run cut short by anything
+        # else must be reported on its first attempt, or the person sits through
+        # two delays to be told something that was never going to change.
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.fail_after_subtitles = 1
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched():
+            self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                    subtitle_source=SubtitleSource.ALL,
+                )
+            )
+        self.assertEqual(clock.slept, [])
+        self.assertEqual(FakeYdl.caption_runs, 1)
+
+    def test_a_caption_run_waits_out_a_rate_limit_and_asks_only_for_what_is_missing(self) -> None:
+        # The live endpoint refuses a throttled caption request outright and
+        # yt-dlp never retries one: `downloader/http.py` re-raises any status
+        # below 500 without marking it retryable, so `"retries": 5` cannot help.
+        # The retry therefore has to be the app's, and it is only worth having
+        # if the second attempt does not re-request the language the first one
+        # already saved.
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.fail_after_subtitles = 1
+        FakeYdl.caption_failure_message = RATE_LIMIT_TEXT
+        FakeYdl.caption_failures_remaining = 1
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched():
+            result = self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                    subtitle_source=SubtitleSource.ALL,
+                )
+            )
+            self.assertEqual(len(result.subtitle_paths), 3)
+            self.assertTrue(all(path.is_file() for path in result.subtitle_paths))
+        self.assertEqual(FakeYdl.caption_runs, 2, "the refused attempt should be retried once")
+        self.assertEqual(
+            FakeYdl.reused_subtitles, ["de"], "the language already saved must not be fetched again"
+        )
+        self.assertAlmostEqual(clock.total_slept, 10.0, places=6)
+        self.assertTrue(
+            all(step <= 0.25 for step in clock.slept),
+            "the wait must sleep in short steps so a cancel is not held up",
+        )
+
+    def test_a_caption_run_that_keeps_being_throttled_waits_a_bounded_time_then_reports(self) -> None:
+        # This is the measured shape of the live failure: refused on the very
+        # first request, so nothing is ever written and the run has to report a
+        # rate limit rather than a network fault -- after a bounded wait, not
+        # forever.
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.fail_after_subtitles = 0
+        FakeYdl.caption_failure_message = RATE_LIMIT_TEXT
+        FakeYdl.caption_failures_remaining = 99
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched(), self.assertRaises(
+            DownloadFailure
+        ) as context:
+            self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                    subtitle_source=SubtitleSource.ALL,
+                )
+            )
+        self.assertEqual(FakeYdl.caption_runs, 3, "a throttled run must give up rather than loop")
+        self.assertEqual(context.exception.code, "rate_limited")
+        self.assertIn("429", context.exception.message)
+        self.assertAlmostEqual(clock.total_slept, 40.0, places=6)
+
+    def test_a_rate_limited_caption_run_says_so_instead_of_blaming_the_connection(self) -> None:
+        mapped = friendly_error(RuntimeError(RATE_LIMIT_TEXT))
+        self.assertEqual(mapped.code, "rate_limited")
+        self.assertIn("429", mapped.message)
+        self.assertNotIn("network connection", mapped.message)
+
+    def test_a_caption_run_slows_its_pacing_down_after_being_throttled(self) -> None:
+        # Pacing is what the cap and the interval are for, so a run that has
+        # just been told to slow down should ask less often rather than repeat
+        # itself at the rate that was refused.
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.fail_after_subtitles = 1
+        FakeYdl.caption_failure_message = RATE_LIMIT_TEXT
+        FakeYdl.caption_failures_remaining = 99
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched():
+            result = self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                    subtitle_source=SubtitleSource.ALL,
+                )
+            )
+        self.assertEqual(FakeYdl.caption_pacing, [0.6, 1.2, 2.0])
+        # One language survived the first attempt, so the run reports that
+        # rather than failing outright.
+        self.assertIn("1 of 3", result.warning or "")
+
+    def test_a_caption_run_stops_waiting_the_moment_it_is_cancelled(self) -> None:
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.fail_after_subtitles = 1
+        FakeYdl.caption_failure_message = RATE_LIMIT_TEXT
+        FakeYdl.caption_failures_remaining = 99
+        clock = _FakeClock()
+        announced: list[str] = []
+
+        def _progress(event: Any) -> None:
+            announced.append(event.message)
+
+        def _cancel() -> bool:
+            # Cancelled as soon as the person has been told a wait is starting,
+            # and not before, so the first attempt really does run.
+            return any("slow down" in message for message in announced)
+
+        with tempfile.TemporaryDirectory() as directory, clock.patched(), self.assertRaises(
+            CancelledError
+        ):
+            self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                    subtitle_source=SubtitleSource.ALL,
+                ),
+                progress=_progress,
+                cancel_check=_cancel,
+            )
+        self.assertEqual(clock.slept, [], "a cancelled wait must not sleep through its delay")
+        self.assertEqual(FakeYdl.caption_runs, 1)
 
     def test_a_caption_run_that_wrote_nothing_still_fails(self) -> None:
         FakeYdl.caption_tracks = {}
