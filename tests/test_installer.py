@@ -13,7 +13,9 @@ and installing it rather than by asserting on text.
 
 from __future__ import annotations
 
+import ast
 import re
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -21,6 +23,8 @@ ROOT = Path(__file__).resolve().parents[1]
 ISS = ROOT / "scripts" / "clipdock.iss"
 BUILD = ROOT / "scripts" / "build_installer.ps1"
 INFO = ROOT / "scripts" / "installer" / "info-before.txt"
+EXE_BUILD = ROOT / "scripts" / "build_exe.ps1"
+VERSION_FILE_TOOL = ROOT / "tools" / "make_version_file.py"
 
 
 def _meaningful_lines(text: str) -> list[str]:
@@ -362,6 +366,354 @@ class InstallerScriptTests(unittest.TestCase):
             if key in {"source", "name", "filename", "description", "parameters"}:
                 continue  # legitimately repeatable in [Icons] and [Run]
             self.assertEqual(len(values), 1, f"{key} is set {len(values)} times: {values}")
+
+
+class VersionResourceTests(unittest.TestCase):
+    """The frozen executable's Windows version resource.
+
+    `dist\\ClipDock\\ClipDock.exe` reported an empty FileVersion, ProductName and
+    FileDescription, so Task Manager, file Properties and Windows' installed-
+    programs list all showed nothing for it.  `ClipDock-Setup.exe` identifies
+    itself correctly, because Inno Setup writes a resource of its own - so the
+    installer named a version while the program it installed named none.  That
+    was PROJECT_MAP.md:266.
+
+    The resource is generated rather than committed, which is the point of these
+    tests.  A committed version file would be a fifth copy of the version, and
+    this project has already shipped two stale ones - a stale FFmpeg User-Agent
+    and an installer first page that kept naming the previous release.  So the
+    checks below are about the value *flowing* from `youtube_downloader.__version__`
+    rather than about the contents of a checked-in file.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        if not EXE_BUILD.is_file():
+            raise unittest.SkipTest("scripts/build_exe.ps1 is not present")
+        if not VERSION_FILE_TOOL.is_file():
+            raise unittest.SkipTest("tools/make_version_file.py is not present")
+        cls.script = EXE_BUILD.read_text(encoding="utf-8")
+
+    # --- the build is wired to it at all ------------------------------------
+
+    def test_the_executable_build_passes_a_version_resource(self) -> None:
+        """Without `--version-file` PyInstaller writes no resource at all."""
+
+        self.assertIn("--version-file", self.script)
+        self.assertIn("make_version_file.py", self.script)
+
+    def test_the_resource_is_generated_before_pyinstaller_runs(self) -> None:
+        """PyInstaller reads the file when it starts.  A resource generated
+        afterwards would be a correct file and an empty executable.
+
+        The anchor is the `$arguments = @(` block rather than the word
+        "PyInstaller", which occurs at the top of the file in a comment saying
+        PyInstaller is build-time only - a first attempt used the bare word and
+        compared against that comment.
+        """
+
+        generated = self.script.find("make_version_file.py")
+        assembled = self.script.find("$arguments = @(")
+        invoked = self.script.find("& $venvPython @arguments")
+        self.assertNotEqual(generated, -1, "the version file is never generated")
+        self.assertNotEqual(assembled, -1, "the PyInstaller arguments are not assembled")
+        self.assertNotEqual(invoked, -1, "PyInstaller is never invoked")
+        self.assertLess(
+            generated,
+            assembled,
+            "$versionFile is assigned by the generation call, so the generation "
+            "must come before the argument list that uses it",
+        )
+        self.assertLess(assembled, invoked, "the arguments are built after the build")
+
+    def test_the_product_name_is_passed_in_rather_than_repeated(self) -> None:
+        """`$appName` in build_exe.ps1 is the one place the product name lives.
+
+        The tool defaults its own `--product` to "ClipDock", which is a second
+        copy, so the build has to override it - otherwise renaming the product
+        renames the executable and leaves the resource claiming otherwise.
+        """
+
+        self.assertIn("$appName = ", self.script)
+        self.assertIn("--product $appName", self.script)
+
+    def test_the_resource_is_generated_into_the_ignored_build_folder(self) -> None:
+        """It must not land somewhere git tracks.
+
+        `build/` is ignored, which is what keeps the generated copy from becoming
+        a committed version - the drift this whole approach exists to prevent.
+        The path is asserted rather than the file's existence, because the file
+        only exists during a build and a test that waited for it would be a test
+        that could not fail in a clean checkout.
+        """
+
+        self.assertIn('Join-Path $specDir "version_info.txt"', self.script)
+        self.assertIn('$specDir = Join-Path $root "build"', self.script)
+
+        ignore = ROOT / ".gitignore"
+        self.assertTrue(ignore.is_file(), ".gitignore is missing")
+        patterns = ignore.read_text(encoding="utf-8").splitlines()
+        self.assertTrue(
+            any(line.strip().rstrip("/") == "build" for line in patterns),
+            "build/ is not ignored, so a generated version file could be committed",
+        )
+
+    # --- the version itself --------------------------------------------------
+
+    def test_the_resource_names_the_application_version(self) -> None:
+        """The two strings Windows displays are the application's own version."""
+
+        from youtube_downloader import __version__
+        from tools.make_version_file import render
+
+        rendered = render("ClipDock", __version__, "desc")
+        self.assertIn(f"StringStruct(u'FileVersion', u'{__version__}')", rendered)
+        self.assertIn(f"StringStruct(u'ProductVersion', u'{__version__}')", rendered)
+
+    def test_the_binary_version_is_the_application_version_padded(self) -> None:
+        """Windows' numeric version is four integers, not three.
+
+        `filevers` is what Task Manager's Details tab and most log parsers read,
+        so a three-part `__version__` has to be padded rather than rejected.
+        """
+
+        from youtube_downloader import __version__
+        from tools.make_version_file import _quadruple, render
+
+        numbers = [int(p) for p in __version__.split(".")]
+        numbers += [0] * (4 - len(numbers))
+        expected = tuple(numbers[:4])
+        self.assertEqual(_quadruple(__version__), expected)
+        shown = ", ".join(str(n) for n in expected)
+        self.assertIn(f"filevers=({shown})", render("ClipDock", __version__, "desc"))
+        self.assertIn(f"prodvers=({shown})", render("ClipDock", __version__, "desc"))
+
+    def test_a_different_version_produces_a_different_resource(self) -> None:
+        """The anti-hardcoding guard.
+
+        If the tool contained a version literal, `render` would ignore its
+        argument and this would fail.  Asserting on the *output* rather than on
+        the source is what makes it meaningful: a source scan for "0.2.0" would
+        also have to forbid the word appearing in a comment, which is not the
+        property being tested.
+        """
+
+        from youtube_downloader import __version__
+        from tools.make_version_file import render
+
+        real = render("ClipDock", __version__, "desc")
+        invented = render("ClipDock", "9.9.9", "desc")
+        self.assertNotEqual(real, invented)
+
+        changed = [
+            (before, after)
+            for before, after in zip(real.splitlines(), invented.splitlines())
+            if before != after
+        ]
+        self.assertTrue(changed, "the two resources are identical line for line")
+        for before, after in changed:
+            for line in (before, after):
+                self.assertTrue(
+                    "filevers=" in line
+                    or "prodvers=" in line
+                    or "FileVersion" in line
+                    or "ProductVersion" in line,
+                    f"changing the version altered a line that is not a version: "
+                    f"{line!r}",
+                )
+
+    def test_a_two_part_version_is_padded_rather_than_rejected(self) -> None:
+        """Worth guarding because it is the shape a hurried bump takes."""
+
+        from tools.make_version_file import _quadruple, render
+
+        self.assertEqual(_quadruple("1.2"), (1, 2, 0, 0))
+        self.assertIn("filevers=(1, 2, 0, 0)", render("P", "1.2", "d"))
+
+    def test_the_written_file_carries_no_byte_order_mark(self) -> None:
+        """PyInstaller reads the file as UTF-8 and evaluates it, so a BOM is a
+        syntax error rather than something it tolerates.
+
+        `Out-File -Encoding utf8` on Windows PowerShell 5.1 emits one, which makes
+        this a realistic failure rather than a theoretical one.
+        """
+
+        from tools.make_version_file import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "version_info.txt"
+            self.assertEqual(main(["--output", str(target), "--product", "P"]), 0)
+            raw = target.read_bytes()
+            self.assertFalse(
+                raw.startswith(b"\xef\xbb\xbf"),
+                "the generated file starts with a UTF-8 BOM",
+            )
+            ast.parse(raw.decode("utf-8"))
+
+    def test_the_check_mode_notices_a_stale_file(self) -> None:
+        """`--check` is what lets the suite verify a committed copy.
+
+        It has to fail on a *differing* file and not merely on a missing one, or
+        it would pass on anything it can read.
+        """
+
+        from tools.make_version_file import main
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "version_info.txt"
+            self.assertEqual(main(["--output", str(target), "--product", "P"]), 0)
+            self.assertEqual(
+                main(["--check", "--output", str(target), "--product", "P"]), 0
+            )
+
+            target.write_text("VSVersionInfo(ffi=FixedFileInfo())\n", encoding="utf-8")
+            self.assertEqual(
+                main(["--check", "--output", str(target), "--product", "P"]), 1,
+                "--check accepted a file that does not match the application version",
+            )
+            self.assertEqual(
+                main(["--check", "--output", str(Path(directory) / "absent.txt")]), 1,
+                "--check accepted a file that is not there",
+            )
+
+    # --- the check that would have caught the first draft --------------------
+
+    def test_pyinstaller_itself_can_read_the_generated_resource(self) -> None:
+        """Load it with PyInstaller's own parser, not a substitute.
+
+        The first draft of the generated file was written from memory and used
+        the long-form FixedFileInfo keys found in hand-written examples -
+        `VOS_NT_WINDOWS32`, `VFT_APP` and so on.  PyInstaller's FixedFileInfo
+        takes `OS`, `fileType`, `subtype` and `date`, so the build would have
+        failed with "unexpected keyword argument", at build time, on a machine
+        whose only mistake was trusting a file that looked right.
+
+        Every check above is satisfied by a file that PyInstaller rejects, because
+        the file's syntax is Python but its top-level expression is a *call* -
+        which ast.literal_eval refuses by design.  So this test goes through the
+        loader the build itself uses.  It is skipped, not failed, when PyInstaller
+        is absent, because it is a build-time-only dependency and the rest of the
+        suite must not require it.
+        """
+
+        try:
+            from PyInstaller.utils.win32.versioninfo import (
+                load_version_info_from_text_file,
+            )
+        except ImportError:
+            self.skipTest("PyInstaller is a build-time-only dependency and is absent")
+
+        from youtube_downloader import __version__
+        from tools.make_version_file import _quadruple, main, render
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "version_info.txt"
+            self.assertEqual(main(["--output", str(target), "--product", "ClipDock"]), 0)
+            try:
+                info = load_version_info_from_text_file(str(target))
+            except Exception as error:  # noqa: BLE001 - the message is the assertion
+                self.fail(
+                    f"PyInstaller rejected the generated resource: {error}\n"
+                    f"{render('ClipDock', __version__, 'desc')}"
+                )
+
+        ffi = info.ffi
+        self.assertEqual(ffi.sig, 0xFEEF04BD)
+        self.assertEqual(ffi.fileType, 0x1, "an application is VFT_APP")
+        # Read the binary version the way Windows does - MS holds the major pair
+        # and LS the minor pair - rather than comparing text, because the whole
+        # point is that these are numbers now.
+        shown = (
+            ffi.fileVersionMS >> 16,
+            ffi.fileVersionMS & 0xFFFF,
+            ffi.fileVersionLS >> 16,
+            ffi.fileVersionLS & 0xFFFF,
+        )
+        self.assertEqual(
+            shown,
+            _quadruple(__version__),
+            "the binary version does not match the application version",
+        )
+
+        # The strings are what a person reads; the numbers above are what a
+        # machine reads.  Both are the same version and both are checked.
+        strings = {
+            struct.name: struct.val
+            for kid in info.kids
+            if type(kid).__name__ == "StringFileInfo"
+            for table in kid.kids
+            for struct in table.kids
+        }
+        self.assertEqual(strings["FileVersion"], __version__)
+        self.assertEqual(strings["ProductVersion"], __version__)
+        self.assertEqual(strings["ProductName"], "ClipDock")
+        self.assertEqual(strings["OriginalFilename"], "ClipDock.exe")
+
+    def test_a_missing_resource_is_an_exception_and_not_an_empty_result(self) -> None:
+        """Why the release pass must catch rather than test for emptiness.
+
+        PyInstaller's reader of a *built* executable raises when the image
+        carries no RT_VERSION resource, rather than returning something falsy:
+
+            pywintypes.error (1813, 'EnumResourceNamesW',
+            'The specified resource type cannot be found in the image file')
+
+        Measured against the shipped 0.2.0 files, where the application
+        executable raised this and the installer returned 0.2.0.0.  The natural
+        guard is therefore `if not info:`, and on this reader that branch is
+        unreachable - the exception fires first.  A check written that way would
+        report success on a broken executable by never entering its own failure
+        branch, which is the lesson this project has now learned six times.
+
+        What is pinned is the reader's *shape*, not whether this particular build
+        carries a resource: `dist\\ClipDock\\ClipDock.exe` predates the wiring, so
+        asserting it has one would fail until the next rebuild, and a test whose
+        result depends on when it was last run is not a test.  The falsifiable
+        claim is that the call never yields a falsy value - it raises, or it
+        returns a populated resource, and there is no third outcome for a caller
+        to guard against incorrectly.
+        """
+
+        try:
+            from PyInstaller.utils.win32.versioninfo import (
+                read_version_info_from_executable,
+            )
+        except ImportError:
+            self.skipTest("PyInstaller is a build-time-only dependency and is absent")
+
+        frozen = ROOT / "dist" / "ClipDock" / "ClipDock.exe"
+        if not frozen.is_file():
+            self.skipTest("no frozen build in dist\\; run scripts\\build_exe.ps1 first")
+
+        info = None
+        raised: Exception | None = None
+        try:
+            info = read_version_info_from_executable(str(frozen))
+        except Exception as error:  # noqa: BLE001 - the exception IS the assertion
+            raised = error
+
+        if raised is not None:
+            self.assertIn(
+                "1813",
+                str(raised),
+                "expected ERROR_RESOURCE_TYPE_NOT_FOUND for an image with no "
+                f"RT_VERSION, got {type(raised).__name__}: {raised}",
+            )
+        else:
+            # The other permitted outcome.  Asserting it is populated is what
+            # stops "returned something" from being mistaken for "returned a
+            # usable version".
+            self.assertTrue(
+                info,
+                "read_version_info_from_executable returned a falsy value; the "
+                "release pass's `if not info` guard would then be unreachable "
+                "for the opposite reason",
+            )
+            self.assertNotEqual(
+                info.ffi.fileVersionMS,
+                0,
+                "a resource was returned but its binary version is zero",
+            )
 
 
 class BuildScriptTests(unittest.TestCase):

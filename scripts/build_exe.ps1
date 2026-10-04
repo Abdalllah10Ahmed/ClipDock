@@ -60,6 +60,31 @@ foreach ($target in @($appDir, $workDir)) {
 }
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
+# Generate the Windows version resource for the executable.  Without this,
+# ClipDock.exe reports an empty FileVersion, ProductName and FileDescription, so
+# Task Manager, file Properties and Windows' installed-programs list all show
+# nothing for it - while ClipDock-Setup.exe identifies itself perfectly well,
+# because Inno Setup writes a resource of its own.  The asymmetry was recorded as
+# an open item at PROJECT_MAP.md:266.
+#
+# The file is generated rather than committed because a committed copy is a
+# second place a version can be typed, and this project has already paid for two
+# stale ones: a stale FFmpeg User-Agent, and an installer first page that kept
+# naming the previous release.  Generating from youtube_downloader.__version__
+# means a bump to __init__.py is the only bump there is, and
+# tests\test_installer.py compares the result against the application version so
+# a mismatch fails the suite rather than a user's file Properties dialog.
+#
+# The product name is passed in rather than repeated inside the tool, so it still
+# comes from $appName above and cannot drift from the executable's name.
+$versionFile = Join-Path $specDir "version_info.txt"
+& $venvPython (Join-Path $root "tools\make_version_file.py") `
+    --output $versionFile `
+    --product $appName
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not generate the executable's version resource."
+}
+
 $arguments = @(
     "-m", "PyInstaller",
     "--noconfirm",
@@ -69,6 +94,7 @@ $arguments = @(
     "--distpath", $distRoot,
     "--workpath", $workDir,
     "--specpath", $specDir,
+    "--version-file", $versionFile,
     "--paths", $root,
     "--hidden-import", "yt_dlp",
     "--collect-all", "yt_dlp",
