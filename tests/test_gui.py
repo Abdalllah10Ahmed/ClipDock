@@ -205,6 +205,128 @@ class ProgressReportingEngine:
         return self._inner.download(request, progress=progress, cancel_check=cancel_check)
 
 
+class SmallerFileExplanationTests(unittest.TestCase):
+    """The absence of an option has to be explained, and the explanation has to be true.
+
+    These need no window and no QApplication: `_why_no_smaller_file` is a static
+    method, so there is nothing to skip if Qt is unavailable. That matters here
+    because the defect being pinned was a *false* sentence, and a test that
+    quietly skips is a test that would have let it through.
+
+    The sentence this replaces claimed the refused streams "are WebM, and
+    converting those would mean re-encoding". Measured on Sprite Fright, the
+    refused stream at 858p is format 400: `ext=mp4`, `av01`, 104 MB. It is an MP4
+    file, it needs no re-encoding, and it was refused for its codec alone.
+    """
+
+    def test_the_refused_codec_and_size_are_named(self) -> None:
+        refused = 114_000_000
+        quality = VideoQuality(
+            "hls-858", 858, 24, False, 1542, "mp4", 351_000_000,
+            unoffered_smaller_size_bytes=refused,
+            unoffered_smaller_codec="av1",
+        )
+        message = MainWindow._why_no_smaller_file(quality)
+
+        # The codec the engine recorded has to be the codec the user is told.
+        self.assertIn("AV1", message)
+        # And the size, through the same formatter the rest of the app uses, so
+        # the sentence cannot drift from the model it describes. Comparing against
+        # `format_size` rather than a literal like "114 MB" is deliberate: those
+        # units are binary, so 114_000_000 is 108.7 MB, and hardcoding the wrong
+        # arithmetic in the test is how this assertion came to fail first.
+        self.assertIn(format_size(refused), message)
+        # The saving is the point of mentioning it at all.
+        self.assertIn("H.264", message)
+
+    def test_it_never_claims_the_refused_streams_are_webm(self) -> None:
+        """The specific falsehood, pinned so it cannot come back.
+
+        Every real video measured serves the refused alternatives in MP4
+        containers, so "WebM" was never true of anything a user could have
+        downloaded. Asserting its absence directly is stronger than asserting
+        the presence of the right wording, which could be reworded later.
+        """
+
+        for codec in ("av1", "vp9", "h264"):
+            quality = VideoQuality(
+                f"hls-{codec}", 1080, 60, False, 1920, "mp4", 60_000_000,
+                unoffered_smaller_size_bytes=26_000_000,
+                unoffered_smaller_codec=codec,
+            )
+            message = MainWindow._why_no_smaller_file(quality)
+            self.assertNotIn("WebM", message)
+            self.assertNotIn("webm", message)
+            # "re-encoding" is the other half of the false claim: these streams
+            # need none, which is precisely why the wording was wrong.
+            self.assertNotIn("re-encod", message)
+
+    def test_vp9_is_named_as_vp9(self) -> None:
+        refused = 23_000_000
+        quality = VideoQuality(
+            "hls-720", 720, 24, False, 1280, "mp4", 51_000_000,
+            unoffered_smaller_size_bytes=refused,
+            unoffered_smaller_codec="vp9",
+        )
+        message = MainWindow._why_no_smaller_file(quality)
+        self.assertIn("VP9", message)
+        self.assertIn(format_size(refused), message)
+
+    def test_nothing_smaller_at_all_says_only_that(self) -> None:
+        """When there is genuinely nothing, it must not invent something.
+
+        The engine leaves both fields None when no smaller stream exists at all,
+        so the message has to fall back to the plain truth. Asserting it names
+        no codec stops a stale or defaulted value from leaking into the text.
+        """
+
+        quality = VideoQuality("only-1080", 1080, 60, False, 1920, "mp4", 60_000_000)
+        self.assertFalse(quality.has_unoffered_smaller_alternative)
+        message = MainWindow._why_no_smaller_file(quality)
+
+        self.assertIn("only one H.264", message)
+        for codec_name in ("AV1", "VP9", "WebM"):
+            self.assertNotIn(codec_name, message)
+
+    def test_a_zero_size_does_not_count_as_a_refusal(self) -> None:
+        """A recorded size of zero is no saving at all, so it must not be shown.
+
+        The model treats zero as absent, and the explanation has to agree with
+        the model or the two drift: a tooltip claiming a smaller stream exists
+        when nothing does is the same class of defect as the one being fixed.
+        """
+
+        quality = VideoQuality(
+            "hls-1080", 1080, 60, False, 1920, "mp4", 60_000_000,
+            unoffered_smaller_size_bytes=0,
+            unoffered_smaller_codec="av1",
+        )
+        self.assertFalse(quality.has_unoffered_smaller_alternative)
+        self.assertIn("only one H.264", MainWindow._why_no_smaller_file(quality))
+
+    def test_an_unknown_codec_does_not_render_as_the_word_none(self) -> None:
+        """A codec the app does not recognise must still read as English.
+
+        The failure mode this guards is the obvious one: interpolating a raw or
+        defaulted value into a sentence that already names a codec. The first
+        draft fell back to "another codec" and produced "YouTube has a smaller
+        another codec stream here", which this test caught. An unrecognised codec
+        should now drop the word entirely rather than supply a bad one.
+        """
+
+        refused = 26_000_000
+        quality = VideoQuality(
+            "hls-1080", 1080, 60, False, 1920, "mp4", 60_000_000,
+            unoffered_smaller_size_bytes=refused,
+            unoffered_smaller_codec=None,
+        )
+        message = MainWindow._why_no_smaller_file(quality)
+        self.assertIn(format_size(refused), message)
+        self.assertNotIn("None", message)
+        # No stray word between "smaller" and "stream" either.
+        self.assertIn("a smaller stream here", message)
+
+
 class GuiSmokeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -625,7 +747,11 @@ class GuiSmokeTests(unittest.TestCase):
         index = window.stream_preference_combo.findData(StreamPreference.SMALLER_FILE.value)
         self.assertGreaterEqual(index, 0)
         self.assertFalse(window.stream_preference_combo.model().item(index).isEnabled())
-        self.assertIn("only one MP4 stream", window.stream_preference_combo.toolTip())
+        # "only one H.264 stream", not the "only one MP4 stream" this asserted
+        # before.  The constraint is the codec, not the container: a smaller MP4
+        # stream in VP9 or AV1 is refused for its codec alone, so saying "MP4"
+        # implied no smaller MP4 existed when one often does.
+        self.assertIn("only one H.264 stream", window.stream_preference_combo.toolTip())
         window.stream_preference_combo.setCurrentIndex(index)
         self.app.processEvents()
         # A choice that cannot apply must not survive into the request.
