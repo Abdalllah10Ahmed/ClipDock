@@ -367,6 +367,132 @@ class InstallerScriptTests(unittest.TestCase):
                 continue  # legitimately repeatable in [Icons] and [Run]
             self.assertEqual(len(values), 1, f"{key} is set {len(values)} times: {values}")
 
+    # -- start with Windows ----------------------------------------------------
+
+    def _autostart_tasks(self) -> list[str]:
+        tasks = [line for line in _section_body(self.text, "Tasks") if "autostart" in line]
+        self.assertEqual(len(tasks), 1, f"expected one autostart task, got {tasks}")
+        return tasks
+
+    def _autostart_writes(self) -> list[str]:
+        # `uninsdeletevalue` contains `deletevalue`, so the two entries cannot be
+        # told apart by a bare substring - they are told apart by which flag they
+        # actually carry.
+        writes = [
+            line
+            for line in _section_body(self.text, "Registry")
+            if "CurrentVersion\\Run" in line and "uninsdeletevalue" in line
+        ]
+        self.assertEqual(len(writes), 1, f"expected one Run-value write, got {writes}")
+        return writes
+
+    def test_the_autostart_option_is_offered_and_ticked_by_default(self) -> None:
+        """Checked by default is decided by an *absent* flag, so what matters is
+        that neither of the two flags which would change it appears.
+
+        `unchecked` would ship it off, against the decision. `checkedonce` is
+        the trap: it un-ticks the box whenever Inno finds a previous version, so
+        using it here would mean every upgrade silently switched the option off
+        for the people who had left it on - the opposite of the default that was
+        asked for, and invisible until someone noticed ClipDock had stopped
+        starting. Inno's UsePreviousTasks is what remembers a choice the user
+        actually made, and it is on by default, so nothing is needed for that.
+        """
+
+        task = self._autostart_tasks()[0]
+        lowered = task.lower()
+        self.assertNotIn("unchecked", lowered, "the autostart option ships unticked")
+        self.assertNotIn("checkedonce", lowered, "checkedonce un-ticks on every upgrade")
+        # It has to be reachable in the same page as the desktop icon, or a user
+        # who does not want it is left hunting through Windows startup settings.
+        self.assertIn("GroupDescription", task)
+
+    def test_the_autostart_label_says_a_window_will_appear_on_its_own(self) -> None:
+        """The label is where the consent actually happens.
+
+        "Start with Windows" is true and uninformative: a ticked box here is
+        consent to launch a GUI application at every sign-in, and what the
+        person needs to know is that a frameless ClipDock window will then
+        appear unprompted. Asserting the phrases keeps this from being
+        shortened back to something accurate and useless.
+        """
+
+        description = re.search(r'Description:\s*"([^"]*)"', self._autostart_tasks()[0])
+        self.assertIsNotNone(description, "the autostart task has no description")
+        text = description.group(1)
+        self.assertIn("Windows starts", text)
+        self.assertIn("opens by itself", text)
+        self.assertIn("no prompt", text)
+
+    def test_the_autostart_value_is_quoted_per_user_and_points_at_the_executable(self) -> None:
+        """Three properties that each fail differently if dropped.
+
+        HKCU because PrivilegesRequired=lowest never elevates, so an HKLM write
+        would either fail or demand the administrator rights this installer
+        promises not to ask for. Quoted because {localappdata} contains a space
+        and Windows parses an unquoted Run value as the first token plus the
+        rest - the classic hijack, and a reason rather than a style. The
+        executable through the defines, because a literal name would let the
+        product be renamed everywhere except this line.
+        """
+
+        line = self._autostart_writes()[0]
+        self.assertIn("Root: HKCU", line)
+        self.assertNotIn("Root: HKLM", line)
+        self.assertIn("Subkey: \"Software\\Microsoft\\Windows\\CurrentVersion\\Run\"", line)
+        self.assertIn('ValueData: """{app}\\{#ProductExeName}"""', line)
+        for literal in ("ClipDock.exe", "\\ClipDock\\"):
+            self.assertNotIn(literal, line, f"the Run value hardcodes {literal!r}")
+        self.assertIn("Tasks: autostart", line, "the value is written whether or not it was asked for")
+
+    def test_uninstall_removes_the_autostart_entry(self) -> None:
+        """The half that is easy to forget, and the reason it is the common case.
+
+        The task is checked by default, so most machines will hold this value;
+        without `uninsdeletevalue` an uninstall leaves a sign-in entry pointing
+        at a file that has been deleted, once every sign-in, with nothing left
+        installed that could remove it. [UninstallDelete] deliberately stays
+        empty (pinned by its own test) - this is a registry value, not a file,
+        so it does not belong there.
+        """
+
+        write = self._autostart_writes()[0]
+        self.assertIn("uninsdeletevalue", write)
+        self.assertIn("[UninstallDelete]", self.text)
+        self.assertEqual(_section_body(self.text, "UninstallDelete"), [])
+
+        # The promise is also stated to the person deciding whether to install,
+        # not only to the uninstaller.
+        info = INFO.read_text(encoding="utf-8").lower()
+        self.assertIn("start clipdock when windows starts", info)
+
+    def test_unticking_autostart_on_an_upgrade_retracts_the_entry(self) -> None:
+        """Inno creates what is selected and never retracts what an earlier run
+        created, so without this the box would be a lie on the second install.
+
+        A user who unticks the option during an upgrade would still have
+        ClipDock starting at sign-in, because the value written by the previous
+        version is untouched by an upgrade that did not select the task. The
+        `not` operator on a Tasks parameter is Inno's own, so this says exactly
+        "when it was not asked for, make sure it is not there".
+        """
+
+        retractions = [
+            line
+            for line in _section_body(self.text, "Registry")
+            if "CurrentVersion\\Run" in line
+            and "deletevalue" in line
+            and "uninsdeletevalue" not in line
+        ]
+        self.assertEqual(len(retractions), 1, f"expected one retraction, got {retractions}")
+        line = retractions[0]
+        self.assertIn("ValueType: none", line)
+        self.assertIn("Tasks: not autostart", line)
+        self.assertNotIn("uninsdeletevalue", line, "there is nothing left to delete at uninstall")
+        # It must name the same value the write does, or it retracts nothing.
+        self.assertIn("ValueName: \"{#ProductName}\"", line)
+        self.assertIn("ValueName: \"{#ProductName}\"", self._autostart_writes()[0])
+
 
 class VersionResourceTests(unittest.TestCase):
     """The frozen executable's Windows version resource.
