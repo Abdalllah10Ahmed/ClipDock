@@ -8,6 +8,7 @@ import re
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import PropertyMock, patch
@@ -18,7 +19,7 @@ from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QScrollArea
 
 from youtube_downloader.core.binaries import find_icon, require_ffmpeg
-from youtube_downloader.core.errors import DependencyError
+from youtube_downloader.core.errors import CancelledError, DependencyError
 from youtube_downloader.core.updates import UpdateCheck
 
 from youtube_downloader.core.models import (
@@ -203,6 +204,73 @@ class ProgressReportingEngine:
         self._paced(progress, (0.0, 8.0, 12.0, 47.0, 93.0), "Downloading media")
         self._paced(progress, (100.0,), "Downloading media")
         return self._inner.download(request, progress=progress, cancel_check=cancel_check)
+
+
+class PausingEngine:
+    """A download that writes a partial file and then stops only when told to.
+
+    `FakeEngine.download` returns immediately, so there is no moment at which a
+    pause could be pressed and nothing for it to act on.  This one writes the
+    piece, then waits on `cancel_check` the way the real engine waits between
+    fragments, and raises `CancelledError` once the flag is set -- which is
+    exactly the shape the real worker sees, so the window's half is exercised
+    rather than assumed.
+
+    ``writes`` picks what the stopped run leaves behind, because each of the
+    three shapes has to be told apart by the button: a real ``.part``, only the
+    ``.ytdl`` state file that means a run started but got nowhere, and nothing
+    at all.
+
+    ``stops`` is how many runs stop before one is allowed to finish, so a test
+    can watch Resume re-run the job and see it complete instead of hanging on a
+    second stop nobody asked for.
+    """
+
+    def __init__(self, *, writes: str = "part", stops: int = 1) -> None:
+        if writes not in {"part", "state", "nothing"}:
+            raise ValueError(writes)
+        self.writes = writes
+        self.stops = stops
+        self.downloads_started = 0
+
+    def probe(self, url: str, *, progress=None, cancel_check=None):
+        return FakeEngine().probe(url, progress=progress, cancel_check=cancel_check)
+
+    def _run(self, output_dir: Path, progress) -> bool:
+        """Write this run's pieces; return False when the run may finish."""
+        self.downloads_started += 1
+        if self.downloads_started > self.stops:
+            return False
+        if self.writes == "part":
+            (output_dir / "half-done.mp4.part").write_bytes(b"x" * 2048)
+        elif self.writes == "state":
+            (output_dir / "half-done.mp4.ytdl").write_bytes(b"{}")
+        if progress:
+            progress(ProgressEvent("downloading", 3.0, "Downloading media"))
+        return True
+
+    def _stop_when_asked(self, cancel_check) -> None:
+        while not cancel_check():
+            time.sleep(0.005)
+        raise CancelledError()
+
+    def download(self, request, *, progress=None, cancel_check=None):
+        if self._run(request.output_dir, progress):
+            self._stop_when_asked(cancel_check)
+        (request.output_dir / "half-done.mp4.part").unlink(missing_ok=True)
+        output = request.output_dir / "half-done.mp4"
+        output.write_bytes(b"finished media")
+        return DownloadResult(output, request.mode)
+
+    def download_playlist(self, request, *, progress=None, cancel_check=None):
+        if self._run(request.output_dir, progress):
+            self._stop_when_asked(cancel_check)
+        raise AssertionError("a playlist run is never completed by this fake")
+
+    def download_queue(self, request, *, progress=None, cancel_check=None):
+        if self._run(request.output_dir, progress):
+            self._stop_when_asked(cancel_check)
+        raise AssertionError("a queue run is never completed by this fake")
 
 
 class SmallerFileExplanationTests(unittest.TestCase):
@@ -1784,6 +1852,185 @@ class GuiSmokeTests(unittest.TestCase):
         finally:
             window.close()
             self.app.processEvents()
+
+    def _pause_window(self, engine) -> MainWindow:
+        """A shown window whose job is stopped even when the test fails.
+
+        The pause fakes block until they are cancelled -- that is what makes
+        them pauseable at all -- so a test that fails *while* one is running
+        would leave the worker spinning and the suite would hang instead of
+        reporting the failure.  `addCleanup` covers every path out of the test,
+        including an assertion raised before anything was stopped, which a
+        `finally` around the body only covers if the body reached its `try`.
+        """
+        window = MainWindow(engine)
+        window.show()
+        self.app.processEvents()
+
+        def stop() -> None:
+            if window.controller.is_running:
+                window.controller.cancel()
+                self._wait_for_job(window)
+            window.close()
+            self.app.processEvents()
+
+        self.addCleanup(stop)
+        return window
+
+    def test_pause_stops_the_download_and_offers_resume_only_for_what_it_wrote(self) -> None:
+        # The rule for this control is that it is not there until it is real,
+        # and "real" is doing a lot of work: the folder can hold an earlier
+        # session's crash, and offering that alongside the file this job was
+        # writing would be the wrong count on a new button.
+        engine = PausingEngine()
+        window = self._pause_window(engine)
+        window.url_edit.setText("https://youtu.be/id")
+        window._fetch_details()
+        self._wait_for_job(window)
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "last-week.mp4.part").write_bytes(b"z" * 4096)
+            window.destination_edit.setText(directory)
+
+            window._start_download()
+            self.assertTrue(window.controller.is_running)
+            self.assertTrue(
+                window.pause_button.isEnabled(),
+                "a running download is the one thing Pause exists for",
+            )
+            self.assertFalse(
+                window.resume_button.isVisibleTo(window),
+                "nothing has been stopped yet, so there is nothing to resume",
+            )
+
+            window.pause_button.click()
+            self._wait_for_job(window)
+
+            self.assertEqual(engine.downloads_started, 1)
+            self.assertIn("Paused", window.status_label.text())
+            self.assertTrue(window.resume_button.isVisibleTo(window))
+            self.assertTrue(window.resume_button.isEnabled())
+            self.assertIn("1 download", window.resume_button.toolTip())
+            self.assertNotIn("2 downloads", window.resume_button.toolTip())
+            self.assertTrue((Path(directory) / "half-done.mp4.part").is_file())
+
+    def test_a_cancel_is_not_a_pause_and_offers_nothing_to_resume(self) -> None:
+        # Both stops end as the same cancellation as far as the worker is
+        # concerned, and only the intent differs -- so the intent is what has to
+        # be recorded, or Cancel would offer to continue a job the person just
+        # said they did not want.
+        engine = PausingEngine()
+        window = self._pause_window(engine)
+        window.url_edit.setText("https://youtu.be/id")
+        window._fetch_details()
+        self._wait_for_job(window)
+        with tempfile.TemporaryDirectory() as directory:
+            window.destination_edit.setText(directory)
+            window._start_download()
+            self.assertTrue(window.controller.is_running)
+
+            window.cancel_button.click()
+            self._wait_for_job(window)
+
+            self.assertEqual(engine.downloads_started, 1)
+            self.assertIn("Cancelled", window.status_label.text())
+            self.assertFalse(window.resume_button.isVisibleTo(window))
+            self.assertTrue(
+                (Path(directory) / "half-done.mp4.part").is_file(),
+                "Cancel keeps the pieces too; it just does not offer to continue them",
+            )
+
+    def test_a_pause_with_nothing_on_disk_offers_nothing_to_resume(self) -> None:
+        # Two ways for a stop to have left nothing worth continuing, and a
+        # leftover from an earlier session sitting in the same folder for each
+        # of them: the snapshot is what stops that leftover being offered as
+        # though this job had produced it.
+        for writes, marker in (("nothing", "no file at all"), ("state", "only the .ytdl state file")):
+            with self.subTest(writes=writes, marker=marker):
+                engine = PausingEngine(writes=writes)
+                window = self._pause_window(engine)
+                window.url_edit.setText("https://youtu.be/id")
+                window._fetch_details()
+                self._wait_for_job(window)
+                with tempfile.TemporaryDirectory() as directory:
+                    (Path(directory) / "last-week.mp4.part").write_bytes(b"z" * 4096)
+                    window.destination_edit.setText(directory)
+                    window._start_download()
+                    window.pause_button.click()
+                    self._wait_for_job(window)
+
+                    self.assertEqual(engine.downloads_started, 1)
+                    self.assertFalse(
+                        window.resume_button.isVisibleTo(window),
+                        f"a stopped download that left {marker} is not something to continue",
+                    )
+                    self.assertFalse(window.resume_button.isEnabled())
+
+    def test_resume_re_runs_the_job_that_was_paused(self) -> None:
+        # The stored request is used rather than the settings now on screen,
+        # because it is the only record of how the download was being made.
+        # A second run is allowed to finish so the whole round trip is visible:
+        # stopped, offered, re-run, finished.
+        engine = PausingEngine(stops=1)
+        window = self._pause_window(engine)
+        window.url_edit.setText("https://youtu.be/id")
+        window._fetch_details()
+        self._wait_for_job(window)
+        with tempfile.TemporaryDirectory() as directory:
+            window.destination_edit.setText(directory)
+            window._start_download()
+            window.pause_button.click()
+            self._wait_for_job(window)
+            self.assertTrue(window.resume_button.isVisibleTo(window))
+
+            window.resume_button.click()
+            self.assertTrue(window.controller.is_running)
+            self.assertFalse(
+                window.resume_button.isVisibleTo(window),
+                "a running job has nothing to resume while it is running",
+            )
+            self._wait_for_job(window)
+
+            self.assertEqual(engine.downloads_started, 2, "Resume did not re-run the job")
+            self.assertTrue((Path(directory) / "half-done.mp4").is_file())
+            self.assertFalse(
+                window.resume_button.isVisibleTo(window),
+                "a finished download has nothing left to resume",
+            )
+
+    def test_pause_is_offered_only_for_a_download_job(self) -> None:
+        # Reading a video's details is a job like any other as far as the worker
+        # is concerned, and it is the one thing there is nothing to pause: no
+        # file is being written, so a Pause there would be a second Cancel
+        # wearing a different label.
+        class BlockingProbeEngine(FakeEngine):
+            def probe(self, url, *, progress=None, cancel_check=None):
+                while not cancel_check():
+                    time.sleep(0.005)
+                raise CancelledError()
+
+        window = self._pause_window(BlockingProbeEngine())
+        window.url_edit.setText("https://youtu.be/id")
+        window._fetch_details()
+        self.assertTrue(window.controller.is_running)
+        self.assertFalse(window.pause_button.isEnabled())
+        self.assertFalse(window.resume_button.isVisibleTo(window))
+
+        window.cancel_button.click()
+        self._wait_for_job(window)
+        self.assertFalse(window.pause_button.isEnabled())
+
+    def test_pause_does_not_claim_to_be_a_true_pause(self) -> None:
+        # yt-dlp exposes no pause primitive, so what ships is a graceful stop
+        # that keeps the pieces -- and whether the continuation then picks up at
+        # the byte it reached has never been measured against the live service.
+        # The tooltip is the only thing between a reader and that assumption, so
+        # the wording is asserted rather than left to be reworded later.
+        window = self._pause_window(FakeEngine())
+        tooltip = window.pause_button.toolTip()
+        self.assertIn("Not a true pause", tooltip)
+        self.assertIn("keep what has arrived", tooltip)
+        for claim in ("where it left off", "exactly where it stopped", "the same byte it"):
+            self.assertNotIn(claim, tooltip)
 
     def test_the_window_carries_the_program_icon(self) -> None:
         # Windows shows a generic Python icon for a taskbar button or an Alt+Tab

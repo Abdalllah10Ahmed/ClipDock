@@ -48,10 +48,12 @@ from ..core.dependencies import (
 )
 from ..core.engine import (
     Engine,
+    UnfinishedDownload,
     playlist_audio_size_bytes,
     playlist_video_size_bytes,
     quality_matches_target,
     select_playlist_video_quality,
+    unfinished_downloads,
 )
 from ..core.errors import AppError
 from ..core.logging_setup import get_logger
@@ -187,6 +189,27 @@ SUBTITLE_EXTENSIONS = frozenset(item.extension for item in SubtitleFormat)
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
 
+def _piece_fingerprint(
+    item: UnfinishedDownload,
+) -> tuple[tuple[str, ...], int | None]:
+    """What an interrupted download's pieces looked like at one moment.
+
+    Compared before and after a job to decide which leftovers in the folder that
+    job is responsible for.  Counting every unfinished file in the destination
+    instead would count an earlier session's crash as part of this one, and a
+    tooltip that offers to continue two downloads when it will continue one is
+    the same wrong count the Retry button was rebuilt to avoid -- it has simply
+    moved to a different button.
+
+    The piece *names* are part of the answer and not only their sizes: a run
+    that opened a `.part` left behind by an earlier session writes to the same
+    name, so its fingerprint changes and it is correctly claimed, while a
+    fragment that came and went during the job is claimed the same way.
+    """
+
+    return (tuple(part.name for part in item.parts), item.total_bytes)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, engine: Engine | None = None) -> None:
         super().__init__()
@@ -206,6 +229,21 @@ class MainWindow(QMainWindow):
         # kept for its own mode, so switching between them does not lose either.
         self._last_failed_playlist: tuple[str, ...] = ()
         self._last_failed_queue: tuple[str, ...] = ()
+        # Pause and Resume, and the three facts each one needs.
+        #
+        # `_active_request` and `_active_operation` are the only record of *how*
+        # to continue a download: a `.part` file carries no link, and the
+        # settings file remembers a theme and a checkbox, not a job, so nothing
+        # reconstructs a request once the program is closed.  `_resume_snapshot`
+        # is what makes Resume's count honest -- a folder can hold leftovers from
+        # an earlier session, and offering to continue those as though they were
+        # the job just stopped would be the wrong count in a new place.
+        self._pauseable = False
+        self._pausing = False
+        self._active_request: Any = None
+        self._active_operation: Any = None
+        self._paused_request: Any = None
+        self._resume_snapshot: dict[str, tuple[tuple[str, ...], int | None]] = {}
         # The remembered choice is read before the UI is built, because the
         # theme is applied while the widgets are being created and re-applying
         # it afterwards would repaint the window for no reason.
@@ -1016,6 +1054,30 @@ class MainWindow(QMainWindow):
             "Run the last playlist or batch download again"
         )
         self.retry_button.setEnabled(False)
+        # Resume continues a download this session stopped.  It is *hidden*
+        # rather than disabled until then, which is a stricter rule than Retry
+        # follows and the one this control needs: a Resume that is present but
+        # dead is a promise the app cannot keep, because continuing a download
+        # needs the request that was running and nothing survives a restart.
+        self.resume_button = QPushButton("Resume")
+        self.resume_button.setObjectName("Resume")
+        self.resume_button.setToolTip(
+            "Continue a download that was stopped"
+        )
+        self.resume_button.setEnabled(False)
+        self.resume_button.setVisible(False)
+        # Pause is a stop, not a pause.  yt-dlp has no pause primitive to call,
+        # so what this does is cancel the job gently and leave every piece it
+        # has already written where it is; whether the continuation then picks
+        # up at the byte it reached is not established, and neither the tooltip
+        # nor the documentation says that it does.
+        self.pause_button = QPushButton("Pause")
+        self.pause_button.setObjectName("Pause")
+        self.pause_button.setToolTip(
+            "Stop the download and keep what has arrived so far. Not a true pause: "
+            "the file continues from its saved pieces rather than from the exact byte."
+        )
+        self.pause_button.setEnabled(False)
         self.download_button = QPushButton("Download")
         self.download_button.setObjectName("Download")
         self.download_button.setEnabled(False)
@@ -1024,7 +1086,9 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.open_folder_button)
         action_row.addWidget(self.play_button)
         action_row.addWidget(self.retry_button)
+        action_row.addWidget(self.resume_button)
         action_row.addStretch(1)
+        action_row.addWidget(self.pause_button)
         action_row.addWidget(self.cancel_button)
         action_row.addWidget(self.download_button)
         root_layout.addLayout(action_row)
@@ -1674,9 +1738,11 @@ class MainWindow(QMainWindow):
         self.embed_cover_checkbox.toggled.connect(self._embed_cover_changed)
         self.download_button.clicked.connect(self._start_download)
         self.cancel_button.clicked.connect(self._cancel_job)
+        self.pause_button.clicked.connect(self._pause_job)
         self.open_folder_button.clicked.connect(self._open_last_folder)
         self.play_button.clicked.connect(self._play_last_file)
         self.retry_button.clicked.connect(self._retry_failed_items)
+        self.resume_button.clicked.connect(self._resume_paused_job)
         self.controller.progress.connect(self._on_progress)
         self.controller.succeeded.connect(self._on_job_succeeded)
         self.controller.failed.connect(self._on_job_failed)
@@ -2720,15 +2786,13 @@ class MainWindow(QMainWindow):
             message = f"Starting batch of {len(request.urls)} links…"
         else:
             message = "Starting download…"
-        self._set_busy(True, message)
-        self._reset_progress_display()
 
         def operation(progress: Any, cancel_check: Any) -> Any:
             if mode is DownloadMode.PLAYLIST:
                 return self.engine.download_playlist(request, progress=progress, cancel_check=cancel_check)
             return self.engine.download(request, progress=progress, cancel_check=cancel_check)
 
-        self.controller.start(operation)
+        self._start_download_job(request, message, operation)
 
     def _reset_queue_rows(self) -> None:
         """Mark every queued row as waiting again before a new batch starts."""
@@ -2744,6 +2808,141 @@ class MainWindow(QMainWindow):
             self.cancel_button.setEnabled(False)
             self.status_label.setText("Cancelling…")
             self.controller.cancel()
+
+    def _start_download_job(self, request: Any, message: str, operation: Any) -> None:
+        """Run a download job, remembering just enough to offer a Resume.
+
+        Every download path goes through here rather than starting the worker
+        itself, because Pause is only meaningful for a job that can be
+        continued, and only this method knows which request is running and what
+        the destination held before it began.  A probe or an update check starts
+        a worker without passing through here, so its `_pauseable` stays False
+        and the Pause button stays dead for it.
+        """
+
+        self._pauseable = True
+        self._pausing = False
+        self._active_request = request
+        self._active_operation = operation
+        self._paused_request = None
+        # Taken before the first byte rather than read afterwards: the pieces
+        # this job adds are the only evidence of which leftovers it owns, and
+        # there is no second chance to look at the folder as it was.
+        self._resume_snapshot = {
+            item.target_name: _piece_fingerprint(item)
+            for item in self._unfinished_in(request.output_dir)
+        }
+        self._set_busy(True, message)
+        self._reset_progress_display()
+        self.controller.start(operation)
+
+    @staticmethod
+    def _unfinished_in(output_dir: Path) -> tuple[UnfinishedDownload, ...]:
+        """Interrupted downloads in ``output_dir``, never raising.
+
+        A destination may not exist yet, may be a file, or may be unreadable;
+        none of those is a reason to refuse to start a download.
+        """
+
+        try:
+            return unfinished_downloads(output_dir)
+        except OSError:
+            return ()
+
+    def _resumable_downloads(self, output_dir: Path) -> tuple[UnfinishedDownload, ...]:
+        """Interrupted downloads *this job* is responsible for and can continue.
+
+        Three conditions, and dropping any one of them makes the button lie:
+        real bytes have to be on disk (a lone state file is a run that started,
+        not one that got anywhere), the piece has to differ from what the folder
+        held before the job began (or an earlier session's crash is offered as
+        though it were this one), and the job has to have been stopped by Pause
+        rather than finished or Cancelled.
+        """
+
+        if self._paused_request is None:
+            return ()
+        return tuple(
+            item
+            for item in self._unfinished_in(output_dir)
+            if item.has_fragments
+            and self._resume_snapshot.get(item.target_name) != _piece_fingerprint(item)
+        )
+
+    def _pause_job(self) -> None:
+        """Stop the running download gently, keeping every piece written so far.
+
+        This is a cancel that intends to continue, and the distinction is the
+        whole of what the button means.  yt-dlp has no pause primitive to call,
+        so the stop is the same stop Cancel performs -- which is also why the
+        partial file can still be locked for as long as the worker lives.  What
+        the app can promise is that nothing is deleted and that Resume is
+        offered afterwards if there is anything real to continue; that the next
+        run then continues at the byte it reached rather than starting over is
+        **not** established, and no wording here claims otherwise.
+        """
+
+        if not self.controller.is_running or not self._pauseable:
+            return
+        self._pausing = True
+        self._paused_request = self._active_request
+        self.pause_button.setEnabled(False)
+        self.status_label.setText("Stopping - what has downloaded so far is kept")
+        self.status_bar.showMessage("Stopping - what has downloaded so far is kept", 8000)
+        self.controller.cancel()
+
+    def _resume_paused_job(self) -> None:
+        """Re-run the exact job Pause stopped.
+
+        The stored request is used rather than the settings now on screen, for
+        the same reason Resume is offered at all: the request is the only record
+        of how this download was being made.  It also keeps the file going to
+        the folder it started in, whatever the destination box has since been
+        changed to.
+
+        The snapshot is deliberately **not** retaken.  Those pieces are what the
+        continuation is going to write into, and re-sampling here would file
+        them as pre-existing -- so a second pause would then look like it
+        produced nothing and Resume would vanish.
+        """
+
+        request = self._paused_request
+        operation = self._active_operation
+        if request is None or operation is None or self.controller.is_running:
+            return
+        self._paused_request = None
+        self._pausing = False
+        self._pauseable = True
+        self._set_busy(True, "Continuing the download that was paused…")
+        self._reset_progress_display()
+        self.controller.start(operation)
+
+    def _refresh_resume_button(self) -> None:
+        """Show Resume only when it can actually do something.
+
+        Hidden rather than left greyed out, which is stricter than Retry and is
+        the point of the control: it appears when a stopped download is really
+        there to continue and is not there at all otherwise.
+        """
+
+        request = self._paused_request
+        if request is None or self.controller.is_running:
+            self.resume_button.setEnabled(False)
+            self.resume_button.setVisible(False)
+            return
+        resumable = self._resumable_downloads(request.output_dir)
+        if not resumable:
+            self.resume_button.setEnabled(False)
+            self.resume_button.setVisible(False)
+            return
+        count = len(resumable)
+        noun = "download" if count == 1 else "downloads"
+        self.resume_button.setVisible(True)
+        self.resume_button.setEnabled(True)
+        self.resume_button.setToolTip(
+            f"Continue the {count} {noun} the Pause stopped; they keep saving to the "
+            "folder they started in, and what has already arrived is kept"
+        )
 
     def _reset_progress_display(self, *, indeterminate: bool = True) -> None:
         """Start the bar again for a new operation.
@@ -3106,15 +3305,12 @@ class MainWindow(QMainWindow):
             )
             return
 
-        self._set_busy(True, message)
-        self._reset_progress_display()
-
         def operation(progress: Any, cancel_check: Any) -> Any:
             if mode is DownloadMode.PLAYLIST:
                 return self.engine.download_playlist(request, progress=progress, cancel_check=cancel_check)
             return self.engine.download_queue(request, progress=progress, cancel_check=cancel_check)
 
-        self.controller.start(operation)
+        self._start_download_job(request, message, operation)
 
     @staticmethod
     def _format_duration(seconds: float | None) -> str:
@@ -3136,7 +3332,14 @@ class MainWindow(QMainWindow):
             self._show_error("Operation failed", "An unexpected error stopped the operation.")
 
     def _on_job_cancelled(self) -> None:
-        self._set_busy(False, "Cancelled")
+        # A stop that was asked for by Pause still ends as a cancellation as far
+        # as the worker is concerned; only the wording differs, and only here.
+        paused = self._pausing
+        self._pausing = False
+        if paused:
+            self._set_busy(False, "Paused - what had downloaded so far is kept")
+        else:
+            self._set_busy(False, "Cancelled")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
         self._progress_value = 0
@@ -3168,8 +3371,18 @@ class MainWindow(QMainWindow):
         self.browse_button.setEnabled(not busy)
         self.download_button.setEnabled(not busy)
         self.cancel_button.setEnabled(busy)
-        # Read last: it derives the button's enabled state from is_running.
+        # Pause is only offered for a download job: there is nothing to pause in
+        # reading a video's details or checking for an update, and a Pause that
+        # stopped one of those would simply be a second Cancel.
+        self.pause_button.setEnabled(busy and self._pauseable)
+        # Read last: they derive their enabled state from is_running.
         self._refresh_retry_button()
+        self._refresh_resume_button()
+        if not busy:
+            # Every job ends here rather than at its own handler, so clearing
+            # this is what keeps a later probe from being pausable because the
+            # download before it was.
+            self._pauseable = False
         if not busy:
             self._refresh_result_actions()
         if message:
