@@ -64,6 +64,24 @@ The **Theme** control is sized to fit the longest name in its own list and never
 
 The choice is kept in a small `settings.json` in your per-user application folder, beside the log files. It is written when you pick a theme and read once at startup, and it is written through a temporary file so an interrupted save cannot leave a truncated file behind. Everything about it fails soft: a missing, unreadable, or hand-edited file just means the program starts on the default theme instead of refusing to open. A theme id that no longer exists - one removed in a later version - is also treated as unset, so an old saved value can never break startup.
 
+That file holds three preferences and nothing else: the theme, whether MP3s get cover art embedded, and whether the automatic update check below is allowed plus the date it last ran. There is no URL, no link, and no record of anything in progress in it — which is why a download can be continued inside the session that stopped it and not after a restart, since the only record of what to continue is held in memory.
+
+## Checking for a newer release
+
+ClipDock asks GitHub whether a newer release exists in two ways. **Help → Check for ClipDock updates** asks immediately, whenever you ask it. On its own, ClipDock also asks a few seconds after the window appears — at most once a day, and only while **Help → Check for updates automatically** is ticked, which it is by default. That switch is the whole reason the automatic half is defensible: a network request you can refuse is a request, and one you cannot is a decision made on your behalf.
+
+What the automatic check does with the answer:
+
+- **If this is already the latest release, you are told nothing.** No status message, no dialog, and the progress bar does not move.
+- **If a newer release exists**, a small notice appears in the bottom-right corner naming the version. It has one button, **Open the release page**, and a close button, and it stays until you dismiss it. It downloads nothing and installs nothing. There is no "Update" button because there would be nothing behind one.
+- **If GitHub cannot be reached, or refuses the request**, you are told nothing either. An offline machine launches normally; a connectivity problem is not presented as an application problem.
+
+The notice does not raise its voice. It says a release has been published and what you are running, with no "now", no exclamation mark, and nothing coloured to look like a warning — a newer release existing is a fact about a web page, not an event. The comparison is against GitHub's `releases/latest`, which excludes pre-releases and drafts, so a candidate build can never be announced as though it were the thing to move to.
+
+Either way the check is report-only. `core/updates.py` has no download path and no installer invocation; the most either version of the check can do is open a web page in your browser.
+
+The switch and the date of the last attempt live in the same `settings.json` as the theme. Arming the check writes nothing, and the date is written only when the attempt actually starts, so a machine that was offline at that moment is not asked again on every single launch.
+
 ## The window frame
 
 The window draws its own title bar instead of using the native one. The replacement keeps everything the shell would have provided: drag the caption to move the window, double-click it or use the middle button to maximize and restore, and resize from any edge. Edge hit-testing is handed back to Windows, so snap layouts and Aero-style snapping still work. Windows' own border thickness is used for the resize grip, capped so it can never grow taller than the title bar itself.

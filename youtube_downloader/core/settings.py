@@ -1,9 +1,15 @@
 """A tiny persistent settings file, so a choice survives a restart.
 
-The application has exactly one thing worth remembering between runs: which
-theme the user picked.  That does not justify a settings framework, a registry
-key, or a dependency, so this is a flat JSON object of strings in the same
-per-user directory the logs already use.
+What it holds is a handful of preferences about how the program looks and
+behaves: the theme that was picked, whether MP3s get cover art, and whether
+the automatic update check is allowed plus the date it last ran.  What it
+deliberately does not hold is a job.  There is no URL, no request, and no
+record of anything in progress, so nothing in this file can be used to
+reconstruct a download after the program is closed - which is why stopping a
+download can be continued in the session it was stopped in and not after a
+restart.  Keeping it that small is also why this does not need a settings
+framework, a registry key, or a dependency: it is a flat JSON object of
+strings in the same per-user directory the logs already use.
 
 Everything here fails soft, and that is the whole design constraint rather than
 a nicety.  This file is read during window construction, so raising from it
