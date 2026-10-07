@@ -111,6 +111,24 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; more than a bare "Create a desktop shortcut".
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
+; Start with Windows.  A [Tasks] entry is checked unless `unchecked` says
+; otherwise, so the absent flag below is the whole of "checked by default" -
+; and there is deliberately no `checkedonce` either, because that flag *un*ticks
+; the box whenever a previous version is found, which would silently switch the
+; option off for everyone the first time they upgrade.  Inno's UsePreviousTasks
+; (its default) is what remembers a choice the user actually made.
+;
+; The description carries the consent question, because a ticked box here is
+; consent to launch a GUI application on every sign-in and "Start with Windows"
+; does not tell anyone that a frameless ClipDock window will then appear on its
+; own.  It sits on the same Select Additional Tasks page as the desktop icon, so
+; a person who does not want it unticks it here rather than hunting through
+; Windows' startup settings afterwards.
+;
+; What the box writes is in [Registry], including the removal on uninstall that
+; the checked default makes the common case rather than a corner case.
+Name: "autostart"; Description: "Start ClipDock when Windows starts - a ClipDock window then opens by itself, with no prompt"; GroupDescription: "Start with Windows:"
+
 [Files]
 ; The whole frozen application: the executable, _internal\ (Python, PySide6 and
 ; yt-dlp), assets\, and the licence notices.  ignoreversion keeps Qt's and
@@ -122,6 +140,37 @@ Source: "..\dist\{#ProductName}\*"; DestDir: "{app}"; Flags: ignoreversion recur
 Name: "{group}\{#ProductName}"; Filename: "{app}\{#ProductExeName}"
 Name: "{group}\Uninstall {#ProductName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#ProductName}"; Filename: "{app}\{#ProductExeName}"; Tasks: desktopicon
+
+[Registry]
+; The autostart entry the `autostart` task above writes, and the half that is
+; easy to forget: taking it away again.
+;
+; HKCU, not HKLM.  PrivilegesRequired=lowest means Setup never elevates, so a
+; machine-wide Run key is not reachable - and it would not be right either:
+; this starts ClipDock for the person who installed it, not for everyone on the
+; machine.  No administrator rights are needed for any of it, which is the same
+; principle the FFmpeg install in core\dependencies.py follows.
+;
+; The data is quoted because {localappdata}\Programs\{#ProductName}\{#ProductExeName}
+; contains a space, and Windows reads an unquoted Run value as the first token
+; plus everything after it - the classic unquoted-image-path hijack, where a
+; directory planted before "ClipDock.exe" wins.  So this is a security property
+; and not a formatting nicety.
+;
+; uninsdeletevalue is the part that gets forgotten.  The task is checked by
+; default, so on most machines this value will exist, and an uninstall without
+; this flag leaves a sign-in entry pointing at an executable that has been
+; deleted - once every sign-in, forever, with nothing left installed that could
+; remove it.
+;
+; The second entry is the other direction of the same problem: Inno only
+; *creates* what is selected, it never retracts what an earlier install
+; created, so upgrading with the box unticked would otherwise leave the value
+; in place and the user's untick would not have taken effect.  `not` is Inno's
+; own boolean operator on a Tasks parameter, so this says exactly "when the
+; person did not ask for this, make sure it is not there".
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "{#ProductName}"; ValueData: """{app}\{#ProductExeName}"""; Flags: uninsdeletevalue; Tasks: autostart
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "{#ProductName}"; Flags: deletevalue; Tasks: not autostart
 
 [Run]
 ; postinstall draws a checked "Run {#ProductName}" box on the final page.

@@ -36,3 +36,7 @@ UNINSTALLING
   ClipDock can be removed at any time from Windows Settings, Apps, Installed
   apps. Removing it does not remove the FFmpeg copy from step 4, because other
   programs on this computer may be using it.
+
+  If you left "Start ClipDock when Windows starts" ticked, removing ClipDock
+  removes that entry too, so sign-in is not left holding a pointer to a program
+  that is no longer on this computer.

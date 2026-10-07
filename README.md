@@ -248,8 +248,9 @@ The hash changes on every build, so it is printed to the console rather than wri
 1. A blue *"Windows protected your PC"* window, if Windows decides to warn. **More info** → **Run anyway**.
 2. The first wizard page, which explains what the program does on first run and that the warning above is expected.
 3. **Next** → the destination folder, pre-filled with `%LOCALAPPDATA%\Programs\ClipDock` and editable.
-4. **Next** → **Install** → **Finish**, with an optional *Start ClipDock* box and an optional *Create a desktop shortcut* box.
-5. ClipDock opens, and before its window appears it checks the computer for FFmpeg. If there is one, nothing is said. If there is not, it asks.
+4. **Next** → *Select Additional Tasks*, which offers **Create a desktop shortcut** (not ticked) and **Start ClipDock when Windows starts** (ticked by default). The second label is the consent, because while it is ticked a frameless ClipDock window opens by itself at every sign-in with no prompt. It writes one value under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` — quoted, because the path has a space in it — and unticking the box on a later install removes it again. Uninstalling removes it as well, which matters precisely because it is ticked by default.
+5. **Install** → **Finish**, with an optional *Start ClipDock* box.
+6. ClipDock opens, and before its window appears it checks the computer for FFmpeg. If there is one, nothing is said. If there is not, it asks.
 
 There is no UAC prompt anywhere in that sequence, including if they right-click and choose *Run as administrator* — a per-user installer resolves to the same folder either way rather than escalating into a machine-wide copy.
 
