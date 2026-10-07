@@ -10,17 +10,19 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
 import time
 import unittest
+from datetime import date
 from pathlib import Path
+from typing import Any
 from unittest.mock import PropertyMock, patch
 
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor, QIcon, QImage, QPalette, QPixmap, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QScrollArea
+from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QPushButton
 
 from youtube_downloader.core.binaries import find_icon, require_ffmpeg
 from youtube_downloader.core.errors import CancelledError, DependencyError
-from youtube_downloader.core.updates import UpdateCheck
+from youtube_downloader.core.updates import RELEASES_URL, UpdateCheck
 
 from youtube_downloader.core.models import (
     DownloadMode,
@@ -1362,7 +1364,9 @@ class GuiSmokeTests(unittest.TestCase):
         window = MainWindow(FakeEngine())
         try:
             reported: list[UpdateCheck] = []
-            window._report_update = reported.append
+            # The handler says whether the check was automatic, so the stub
+            # takes the option rather than dropping it silently.
+            window._report_update = lambda result, **options: reported.append(result)
             window._on_job_succeeded(
                 UpdateCheck(status="current", current="0.1.0", latest="v0.1.0")
             )
@@ -1390,6 +1394,377 @@ class GuiSmokeTests(unittest.TestCase):
         finally:
             window.close()
             self.app.processEvents()
+
+    # -- the automatic update check -----------------------------------------
+
+    @staticmethod
+    def _record_starts(window: MainWindow) -> list[Any]:
+        """Swap the controller's `start` for a recorder.
+
+        The real one runs the operation on a thread, and the operation for an
+        update check is a live request to api.github.com.  Recording instead of
+        running means everything the window does *around* the request is
+        exercised while no test in the suite is capable of making one.
+        """
+
+        started: list[Any] = []
+        window.controller.start = started.append  # type: ignore[method-assign]
+        return started
+
+    def test_the_automatic_check_waits_for_the_window_and_spends_nothing_arming(self) -> None:
+        # "After the window is up and idle rather than during startup": a
+        # delay is the whole of that requirement, and a delay of zero would be
+        # startup.  Arming it writes nothing, because a launch that has not
+        # asked a question has not spent the day's question.
+        window = MainWindow(FakeEngine())
+        try:
+            self.assertFalse(
+                window._update_check_timer.isActive(),
+                "building a window scheduled a network request",
+            )
+            self.assertTrue(window.schedule_update_check())
+            timer = window._update_check_timer
+            self.assertTrue(timer.isActive())
+            self.assertTrue(timer.isSingleShot())
+            self.assertGreater(
+                timer.interval(), 0, "a check at zero delay happens during startup"
+            )
+            self.assertFalse(
+                self.settings_path.exists(),
+                "arming the check recorded it as having run",
+            )
+        finally:
+            window.close()
+            self.app.processEvents()
+        self.assertFalse(
+            window._update_check_timer.isActive(),
+            "closing disarms a check nobody would ever be told about",
+        )
+
+    def test_the_automatic_check_is_a_switch_sits_beside_the_manual_check(self) -> None:
+        window = MainWindow(FakeEngine())
+        try:
+            labels = [action.text() for action in window.help_button.menu().actions()]
+            self.assertIn("Check for updates &automatically", labels)
+            self.assertIn("Check for ClipDock &updates", labels)
+            # On by default, because that is what was decided - and the action
+            # starts life agreeing with the file rather than asserting itself
+            # over it.
+            self.assertTrue(window._auto_update_action.isChecked())
+
+            window._auto_update_action.setChecked(False)
+            self.assertEqual(
+                main_window.read_settings().get(main_window.UPDATE_CHECK_SETTING_KEY),
+                "0",
+                "the switch was shown as off without being remembered as off",
+            )
+            self.assertFalse(
+                window.schedule_update_check(),
+                "a check the person refused to allow was armed anyway",
+            )
+            self.assertFalse(window._update_check_timer.isActive())
+
+            window._auto_update_action.setChecked(True)
+            self.assertEqual(
+                main_window.read_settings().get(main_window.UPDATE_CHECK_SETTING_KEY), "1"
+            )
+            self.assertTrue(window.schedule_update_check())
+            self.assertTrue(window._update_check_timer.isActive())
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_automatic_check_asks_at_most_once_a_day(self) -> None:
+        # The date is the promise that this cannot become a nag: one request a
+        # day at most, recorded when the attempt starts so that a machine with
+        # no network is not asked again on every single launch.
+        window = MainWindow(FakeEngine())
+        try:
+            window.show()
+            self.app.processEvents()
+            started = self._record_starts(window)
+            self.assertTrue(window.schedule_update_check())
+            window._run_scheduled_update_check()
+            self.assertEqual(len(started), 1, "the first attempt did not ask")
+            self.assertEqual(
+                main_window.read_settings().get(main_window.UPDATE_CHECK_DATE_KEY),
+                date.today().isoformat(),
+            )
+
+            window._update_check_timer.stop()
+            self.assertFalse(window.schedule_update_check())
+            window._run_scheduled_update_check()
+            self.assertEqual(
+                len(started),
+                1,
+                "it asked a second time on the day it had already asked",
+            )
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_automatic_check_refuses_to_race_a_download(self) -> None:
+        # Eight seconds is time enough for the person to have started
+        # something.  A refused check also must not record itself as having
+        # run: somebody else's download decided this launch's answer, so the
+        # next launch still gets to ask.
+        window = MainWindow(FakeEngine())
+        try:
+            window.show()
+            self.app.processEvents()
+            started = self._record_starts(window)
+            with patch.object(
+                type(window.controller),
+                "is_running",
+                new_callable=PropertyMock,
+                return_value=True,
+            ):
+                self.assertFalse(window.schedule_update_check())
+                window._run_scheduled_update_check()
+            self.assertEqual(started, [])
+            self.assertFalse(
+                self.settings_path.exists(),
+                "a check that was refused recorded itself as done",
+            )
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_an_automatic_check_says_nothing_when_there_is_nothing_to_say(self) -> None:
+        # Three ways for the answer to be "no news": the release already
+        # installed is the latest, GitHub could not be reached, and GitHub
+        # refused.  None of them is worth interrupting anybody for, and the
+        # third is the one a dialog would have been most tempted by - which
+        # would be a connectivity problem presented as an application problem.
+        window = MainWindow(FakeEngine())
+        try:
+            window.show()
+            self.app.processEvents()
+            status_before = window.status_bar.currentMessage()
+            label_before = window.status_label.text()
+            with patch("youtube_downloader.gui.main_window.QMessageBox") as boxes:
+                for result in (
+                    UpdateCheck(status="current", current="0.2.0", latest="v0.2.0"),
+                    UpdateCheck(
+                        status="unknown",
+                        current="0.2.0",
+                        latest=None,
+                        reason="this computer could not reach GitHub.",
+                    ),
+                    UpdateCheck(
+                        status="unknown",
+                        current="0.2.0",
+                        latest=None,
+                        reason="GitHub refused the request. This is usually its rate limit.",
+                    ),
+                ):
+                    window._report_update(result, automatic=True)
+                boxes.assert_not_called()
+            self.assertIsNone(window._update_toast, "nothing was worth a notice")
+            self.assertEqual(window.status_bar.currentMessage(), status_before)
+            self.assertEqual(window.status_label.text(), label_before)
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_an_available_release_is_offered_once_in_the_corner_and_never_installed(
+        self,
+    ) -> None:
+        window = MainWindow(FakeEngine())
+        try:
+            window.show()
+            self.app.processEvents()
+            status_before = window.status_bar.currentMessage()
+            window._report_update(
+                UpdateCheck(
+                    status="newer",
+                    current="0.2.0",
+                    latest="0.3.0",
+                    release_url="https://example.invalid/clipdock/releases/tag/0.3.0",
+                ),
+                automatic=True,
+            )
+            toast = window._update_toast
+            self.assertIsNotNone(toast, "the one thing the automatic check may say went unsaid")
+            assert toast is not None
+            self.assertTrue(toast.isVisibleTo(window))
+            self.assertEqual(window.status_bar.currentMessage(), status_before)
+
+            heading = window._update_toast_heading.text()
+            detail = window._update_toast_detail.text()
+            self.assertIn("0.3.0", heading)
+            self.assertIn("You have 0.2.0", detail)
+            # The banner must not imply urgency it has not got.  A release
+            # existing is a fact about a web page; it is not an event, and the
+            # program has no grounds to call it one.
+            for overstatement in (
+                "now!",
+                "urgent",
+                "immediately",
+                "important",
+                "act now",
+                "don't miss",
+                "update now",
+            ):
+                self.assertNotIn(overstatement, f"{heading} {detail}".lower())
+
+            buttons = toast.findChildren(QPushButton)
+            self.assertEqual(
+                [button.objectName() for button in buttons],
+                ["updateToastClose", "updateToastOpen"],
+                "the notice offers something other than opening a web page",
+            )
+            texts = [button.text() for button in buttons]
+            self.assertIn("Open the release page", texts)
+            for button in buttons:
+                self.assertNotIn("install", button.text().lower())
+                self.assertNotIn("update now", button.text().lower())
+            note = toast.findChild(QLabel, "updateToastNote")
+            self.assertIsNotNone(note, "the notice never says what it did not do")
+            assert note is not None
+            self.assertIn("has not downloaded anything", note.text())
+
+            # It sits in the corner it was promised: inside the window, and
+            # clear of the status line rather than painted over it.
+            geometry = toast.geometry()
+            status_top = window.status_bar.mapTo(window, QPoint(0, 0)).y()
+            self.assertTrue(window.rect().contains(geometry), "the notice is off screen")
+            self.assertLessEqual(geometry.bottom(), status_top, "the notice covers the status line")
+
+            # Dismissing it hides it, which is the whole of "dismissible".
+            next(button for button in buttons if button.objectName() == "updateToastClose").click()
+            self.assertFalse(toast.isVisibleTo(window))
+
+            # And the only thing it can open is a page, over https.
+            with patch(
+                "youtube_downloader.gui.main_window.QDesktopServices.openUrl"
+            ) as opened:
+                window._open_update_toast_page()
+            self.assertEqual(opened.call_count, 1)
+            self.assertEqual(opened.call_args[0][0].scheme(), "https")
+            self.assertEqual(
+                opened.call_args[0][0].toString(),
+                "https://example.invalid/clipdock/releases/tag/0.3.0",
+            )
+
+            window._update_toast_url = "http://example.invalid/not-https"
+            with patch(
+                "youtube_downloader.gui.main_window.QDesktopServices.openUrl"
+            ) as opened:
+                window._open_update_toast_page()
+            self.assertEqual(
+                opened.call_args[0][0].toString(),
+                RELEASES_URL,
+                "a link that is not https was handed to the desktop",
+            )
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_automatic_check_leaves_the_progress_bar_and_the_status_alone(self) -> None:
+        # The manual check puts the bar into its indeterminate state and has to
+        # put it back; the automatic one never touched it, and filling it would
+        # be the program reporting progress on a job that was invisible by
+        # design.  Both halves are asserted here, because a difference only
+        # one of them has is a difference nobody would notice until it was
+        # wrong.
+        window = MainWindow(FakeEngine())
+        try:
+            window.show()
+            self.app.processEvents()
+            status_before = window.status_bar.currentMessage()
+            self._record_starts(window)
+            bar_before = (
+                window.progress_bar.minimum(),
+                window.progress_bar.maximum(),
+                window.progress_bar.value(),
+            )
+
+            window._update_check_automatic = True
+            window._set_busy(True)
+            window._on_job_succeeded(
+                UpdateCheck(status="current", current="0.2.0", latest="v0.2.0")
+            )
+            self.assertFalse(
+                window._update_check_automatic,
+                "the flag outlived the result it was set for",
+            )
+            self.assertEqual(window.status_bar.currentMessage(), status_before)
+            self.assertEqual(
+                (
+                    window.progress_bar.minimum(),
+                    window.progress_bar.maximum(),
+                    window.progress_bar.value(),
+                ),
+                bar_before,
+                "the automatic check moved a bar for a job nobody saw",
+            )
+            self.assertTrue(window.fetch_button.isEnabled())
+
+            # The manual path still restores what it changed.  Its dialog is
+            # replaced rather than opened: a modal box with nobody to click it
+            # blocks until it is closed, which is exactly what the real check
+            # is meant to wait for and what this test must not.
+            window._set_busy(True)
+            window._reset_progress_display()
+            self.assertEqual(
+                (window.progress_bar.minimum(), window.progress_bar.maximum()), (0, 0)
+            )
+            with patch("youtube_downloader.gui.main_window.QMessageBox"):
+                window._on_job_succeeded(
+                    UpdateCheck(status="current", current="0.2.0", latest="v0.2.0")
+                )
+            self.assertEqual(
+                (window.progress_bar.minimum(), window.progress_bar.maximum()), (0, 100)
+            )
+            self.assertEqual(window.progress_bar.value(), 100)
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_a_failed_automatic_check_reports_nothing_at_all(self) -> None:
+        # `check_for_updates` documents that it never raises, so this should be
+        # unreachable.  It is asserted anyway because the promise is that an
+        # automatic check cannot interrupt anybody, and an unattended modal
+        # dialog is exactly that.
+        window = MainWindow(FakeEngine())
+        try:
+            window.show()
+            self.app.processEvents()
+            status_before = window.status_bar.currentMessage()
+            window._update_check_automatic = True
+            window._set_busy(True)
+            with patch("youtube_downloader.gui.main_window.QMessageBox") as boxes:
+                window._on_job_failed(RuntimeError("nope"))
+            boxes.assert_not_called()
+            self.assertEqual(window.status_bar.currentMessage(), status_before)
+            self.assertFalse(window._update_check_automatic)
+            self.assertTrue(
+                window.fetch_button.isEnabled(),
+                "the refused check never gave the window back",
+            )
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_automatic_check_is_actually_scheduled_by_the_launcher(self) -> None:
+        # Nothing else reaches it.  Every other test builds a window by hand
+        # and would never arm it, so a check dropped from the launch path would
+        # leave a complete, passing test suite around a feature that no longer
+        # happens - which is how "runs on startup" quietly becomes "ran once".
+        source = (Path(main_window.__file__).resolve().parents[1] / "cli.py").read_text(
+            encoding="utf-8"
+        )
+        shown = source.find("window.show()")
+        scheduled = source.find("window.schedule_update_check()")
+        loop = source.find("return app.exec()")
+        self.assertNotEqual(shown, -1, "the launcher no longer shows the window")
+        self.assertNotEqual(scheduled, -1, "the launcher never arms the update check")
+        self.assertNotEqual(loop, -1, "the launcher no longer enters the event loop")
+        self.assertLess(shown, scheduled, "the check is armed before the window is up")
+        self.assertLess(
+            scheduled, loop, "the event loop starts before the check can be armed"
+        )
 
     def test_the_help_menu_sits_in_the_caption_strip(self) -> None:
         # A native menu bar above a drawn caption would read as a second frame.

@@ -106,6 +106,14 @@ def main(argv: list[str] | None = None) -> int:
                 type(error).__name__,
             )
         window.show()
+        # A moment after the window is up, ask GitHub whether a newer ClipDock
+        # exists.  Scheduled rather than run, because doing it during startup
+        # would put a network request in front of every launch to the benefit
+        # of the few launches that have something to report.  It declines
+        # itself if the person switched it off, if it already ran today, or if
+        # something is already using the window - and it says nothing at all
+        # unless there is a release to name.
+        window.schedule_update_check()
         return app.exec()
     finally:
         logging_handle.logger.info("application_stopped")

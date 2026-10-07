@@ -3,10 +3,11 @@ from __future__ import annotations
 import ctypes
 import logging
 from ctypes import wintypes
+from datetime import date
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QPalette
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -101,6 +102,25 @@ TITLE_BAR_HEIGHT = 40
 THEME_SETTING_KEY = "theme"
 # Whether to embed cover art in MP3 downloads.  Stored as "1" or "0".
 EMBED_COVER_SETTING_KEY = "embed_cover"
+# Whether ClipDock may ask GitHub about a newer release on its own, and the
+# date it last did.  Both are stored as plain strings like everything else
+# here: "1"/"0" for the switch, and an ISO date so "has it run today" needs no
+# clock plumbing and survives a machine whose clock was wrong for a moment.
+#
+# The switch exists because the check is now automatic, and an unasked-for
+# network request has to be possible to refuse.  The date exists so that a
+# single launch cannot ask repeatedly: one request a day at most, whatever
+# happens.
+UPDATE_CHECK_SETTING_KEY = "update_check"
+UPDATE_CHECK_DATE_KEY = "update_check_date"
+
+# How long after the window appears before the automatic check runs.  Long
+# enough that startup is genuinely over and the person has had the window for
+# a moment; short enough that a notice still arrives while they are looking at
+# it.  It is deliberately not zero: the check is a network request competing
+# with nothing in particular, and doing it during startup would make launch
+# slower for everyone to benefit the few who have an update waiting.
+UPDATE_CHECK_DELAY_MS = 8000
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -233,7 +253,7 @@ class MainWindow(QMainWindow):
         #
         # `_active_request` and `_active_operation` are the only record of *how*
         # to continue a download: a `.part` file carries no link, and the
-        # settings file remembers a theme and a checkbox, not a job, so nothing
+        # settings file remembers UI preferences, never a job, so nothing
         # reconstructs a request once the program is closed.  `_resume_snapshot`
         # is what makes Resume's count honest -- a folder can hold leftovers from
         # an earlier session, and offering to continue those as though they were
@@ -244,6 +264,23 @@ class MainWindow(QMainWindow):
         self._active_operation: Any = None
         self._paused_request: Any = None
         self._resume_snapshot: dict[str, tuple[tuple[str, ...], int | None]] = {}
+        # The automatic update check, and the one piece of state it needs.
+        #
+        # Both the manual Help-menu check and this one produce an UpdateCheck
+        # that lands in the same handler, so `_update_check_automatic` records
+        # which one it was before the job starts.  It is a flag rather than an
+        # argument because the handler is reached from a dispatcher that does
+        # not know anything about update checks; the flag is set and consumed
+        # by the two callers that do, and cleared by cancellation so a stopped
+        # check cannot leave the next manual one reporting as though it had
+        # been asked for in the background.
+        self._update_check_automatic = False
+        self._update_toast: QFrame | None = None
+        self._update_toast_url: str = RELEASES_URL
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.setSingleShot(True)
+        self._update_check_timer.setInterval(UPDATE_CHECK_DELAY_MS)
+        self._update_check_timer.timeout.connect(self._run_scheduled_update_check)
         # The remembered choice is read before the UI is built, because the
         # theme is applied while the widgets are being created and re-applying
         # it afterwards would repaint the window for no reason.
@@ -287,6 +324,43 @@ class MainWindow(QMainWindow):
         if stored is None:
             return True
         return stored == "1"
+
+    @staticmethod
+    def _update_check_enabled() -> bool:
+        """Whether ClipDock may ask GitHub about a newer release on its own.
+
+        On unless the person turned it off, because the check now makes a
+        network request nobody asked for and the only honest answer to that is
+        a switch.  An absent key is every launch before the first one.  Any
+        other value than ``"1"`` is a "no": the settings file is hand-editable,
+        and a value this code does not recognise must not be read as
+        permission to contact GitHub.
+        """
+
+        return read_settings().get(UPDATE_CHECK_SETTING_KEY, "1") == "1"
+
+    @staticmethod
+    def _set_update_check_enabled(enabled: bool) -> None:
+        write_setting(UPDATE_CHECK_SETTING_KEY, "1" if enabled else "0")
+
+    @staticmethod
+    def _update_check_ran_today(today: str | None = None) -> bool:
+        """Whether the automatic check has already been attempted today.
+
+        Recorded when the check *starts* rather than when it succeeds, so the
+        request is bounded to one a day whatever the outcome: an offline
+        machine is not asked to reach GitHub again and again on every launch
+        for a question it could not answer.  The date is passed in by the
+        tests rather than read here, so "today" is a fact the test states
+        instead of one it has to wait for.
+        """
+
+        target = date.today().isoformat() if today is None else today
+        return read_settings().get(UPDATE_CHECK_DATE_KEY) == target
+
+    @staticmethod
+    def _remember_update_check_started() -> None:
+        write_setting(UPDATE_CHECK_DATE_KEY, date.today().isoformat())
 
     def _build_title_bar(self) -> QWidget:
         """The replacement for the dropped native frame.
@@ -366,6 +440,20 @@ class MainWindow(QMainWindow):
         updates = menu.addAction("Check for ClipDock &updates")
         updates.setStatusTip(f"Ask GitHub whether {RELEASES_URL} has something newer")
         updates.triggered.connect(self._check_for_updates)
+        # The automatic check is a switch rather than a command, so it is
+        # checkable and sits beside the thing it controls.  A switch buried in
+        # a settings page nobody opens would mean the program contacts GitHub
+        # for a person who never saw the control that allowed it; this way the
+        # thing and its refusal are the same place.
+        self._auto_update_action = menu.addAction("Check for updates &automatically")
+        self._auto_update_action.setCheckable(True)
+        self._auto_update_action.setChecked(self._update_check_enabled())
+        self._auto_update_action.setToolTip(
+            "Ask GitHub at most once a day whether a newer ClipDock has been "
+            "published. Nothing is downloaded either way: the most you get is "
+            "a notice in the corner naming the version."
+        )
+        self._auto_update_action.toggled.connect(self._set_update_check_enabled)
         menu.addSeparator()
         check = menu.addAction("&Check dependencies again")
         check.triggered.connect(self._check_dependencies_again)
@@ -415,8 +503,84 @@ class MainWindow(QMainWindow):
 
         self.controller.start(operation)
 
-    def _report_update(self, result: UpdateCheck) -> None:
-        """Say what the check found.  The only action offered is opening a page."""
+    def schedule_update_check(self) -> bool:
+        """Arm the automatic update check, and say whether it was armed.
+
+        Public because it is the one method here called from outside the
+        window, by the application entry point after the window is shown.  The
+        whole decision is made here and made once: the switch the person
+        controls, the date that keeps it to one attempt a day, and whether
+        anything else already owns the window.  It is its own method so the
+        decision can be asserted directly instead of by waiting eight seconds
+        for a timer no test should be allowed to let fire.
+        """
+
+        if not self._update_check_enabled():
+            return False
+        if self._update_check_ran_today():
+            return False
+        if self.controller.is_running:
+            return False
+        self._update_check_timer.start()
+        return True
+
+    def _run_scheduled_update_check(self) -> None:
+        """The timer's callback: ask GitHub, and say nothing about it.
+
+        Everything is re-checked here rather than trusted from
+        ``schedule_update_check``, because eight seconds is time enough for
+        the person to have started something else, and a check that raced a
+        download would be asking for the fight ``_check_for_updates`` already
+        refuses to pick.
+
+        Silence is the default on purpose.  Nothing is written to the status
+        bar, the progress bar is not touched, no dialog opens, and the date is
+        recorded here rather than in the scheduler so that a window closed
+        before the delay elapsed has not spent the day.
+        """
+
+        if not self.isVisible():
+            # Closed, minimised to nothing, or never shown.  The timer is a
+            # child of the window and is stopped by closeEvent as well, so
+            # this is the belt to that pair of braces.
+            return
+        if not self._update_check_enabled() or self._update_check_ran_today():
+            return
+        if self.controller.is_running:
+            # Not recorded: whoever is downloading decided this launch's
+            # answer, so the next launch gets to ask again.
+            return
+        self._remember_update_check_started()
+        self._update_check_automatic = True
+        # No message.  The automatic check does not announce itself, because
+        # saying nothing when there is nothing to say is the whole point of
+        # it.  It still takes the busy state so the same rule that refuses a
+        # second job applies here too.
+        self._set_busy(True)
+
+        def operation(progress: Any, cancel_check: Any) -> Any:
+            return check_for_updates()
+
+        self.controller.start(operation)
+
+    def _report_update(
+        self, result: UpdateCheck, *, automatic: bool = False
+    ) -> None:
+        """Say what the check found.  The only action offered is opening a page.
+
+        An automatic check reports in exactly one case: there is a release to
+        report.  Up to date, unreachable, rate-limited, or a tag nobody can
+        compare are all reasons to say nothing at all, because the person did
+        not ask and none of them is news.  A dialog that opened by itself to
+        say "you are up to date" would be worse than no check, and a dialog
+        that opened by itself to say "I could not reach GitHub" would be the
+        connectivity problem presented as an application problem.
+        """
+
+        if automatic:
+            if result.available:
+                self._show_update_toast(result)
+            return
 
         if result.available:
             self.status_bar.showMessage(f"ClipDock {result.latest} is available.", 10000)
@@ -470,6 +634,127 @@ class MainWindow(QMainWindow):
             f'<a href="{RELEASES_URL}">{RELEASES_URL}</a>.'
         )
         box.exec()
+
+    def _show_update_toast(self, result: UpdateCheck) -> None:
+        """Offer the release in the corner, and offer nothing else.
+
+        The one automatic notice the program is allowed to produce, so the
+        wording is doing the work of a conversation: it names the version, it
+        says what is running, and it stops.  There is no "Update now", no
+        exclamation mark, and nothing red - a newer release existing is a
+        fact about a web page, and dressing it as an event would be the
+        program implying urgency it has no grounds for.
+        """
+
+        toast = self._update_toast
+        if toast is None:
+            toast = self._build_update_toast()
+            self._update_toast = toast
+        latest = result.latest or "a newer release"
+        self._update_toast_heading.setText(f"A newer ClipDock is available: {latest}")
+        self._update_toast_detail.setText(
+            f"You have {result.current}. {latest} has been published."
+        )
+        self._update_toast_url = result.release_url
+        toast.show()
+        toast.raise_()
+        self._position_update_toast()
+
+    def _build_update_toast(self) -> QFrame:
+        """The notice itself, built the first time there is something to notice.
+
+        On demand rather than during construction: a launch that found nothing
+        would otherwise leave a hidden widget in every window ever opened.
+
+        It offers exactly one thing - a web page - and says so.  There is no
+        "Update" button because there is nothing behind one: ClipDock does not
+        install itself, and a second button opening the page the first one
+        describes would be pretending otherwise.
+        """
+
+        frame = QFrame(self)
+        frame.setObjectName("updateToast")
+        # Hiding before any content is laid out, so an empty frame never gets
+        # a chance to be painted between construction and the show() below.
+        frame.hide()
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(8)
+
+        heading_row = QHBoxLayout()
+        heading_row.setSpacing(8)
+        heading = QLabel("", frame)
+        heading.setObjectName("updateToastHeading")
+        self._update_toast_heading = heading
+        heading_row.addWidget(heading, 1)
+        close = QPushButton("✕", frame)
+        close.setObjectName("updateToastClose")
+        close.setFixedSize(22, 22)
+        close.setToolTip("Dismiss this notice")
+        close.clicked.connect(frame.hide)
+        heading_row.addWidget(close, 0, Qt.AlignmentFlag.AlignTop)
+        layout.addLayout(heading_row)
+
+        detail = QLabel("", frame)
+        detail.setObjectName("updateToastDetail")
+        detail.setWordWrap(True)
+        self._update_toast_detail = detail
+        layout.addWidget(detail)
+
+        note = QLabel(
+            "ClipDock has not downloaded anything and does not update itself. "
+            "What changed, and what it weighs, are on the release page.",
+            frame,
+        )
+        note.setObjectName("updateToastNote")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        open_button = QPushButton("Open the release page", frame)
+        open_button.setObjectName("updateToastOpen")
+        open_button.clicked.connect(self._open_update_toast_page)
+        layout.addWidget(open_button, 0, Qt.AlignmentFlag.AlignLeft)
+        return frame
+
+    def _open_update_toast_page(self) -> None:
+        """Open the release page, and only a page that really is one."""
+
+        url = QUrl(self._update_toast_url)
+        if url.scheme() != "https":
+            # `check_for_updates` already replaces an `html_url` that is not
+            # https with the releases page, so this is a second lock on the
+            # same door rather than a repair for something observed.
+            url = QUrl(RELEASES_URL)
+        QDesktopServices.openUrl(url)
+
+    def _position_update_toast(self) -> None:
+        """Keep the notice in the corner it was promised.
+
+        Above the status bar rather than over it: that line is what tells the
+        person what the program is doing, and a notice that hid it would trade
+        one piece of information for another.  The status bar lives inside the
+        scrolling card, so its distance from the bottom edge belongs to the
+        layout and is read back with `mapTo` instead of being assumed here.
+        """
+
+        toast = self._update_toast
+        if toast is None or not hasattr(self, "status_bar"):
+            return
+        toast.adjustSize()
+        margin = 16
+        status_top = self.status_bar.mapTo(self, QPoint(0, 0)).y()
+        top = status_top - toast.height() - margin
+        # Clamped against the window as well as the status bar, so a short
+        # window or a card scrolled past its own footer still shows the notice
+        # on screen instead of half off the bottom of it.
+        top = max(margin, min(top, self.height() - toast.height() - margin))
+        toast.move(max(margin, self.width() - toast.width() - margin), top)
+
+    def resizeEvent(self, event: Any) -> None:
+        """Keep the notice where it was put when the window changes size."""
+
+        super().resizeEvent(event)
+        self._position_update_toast()
 
     def _check_dependencies_again(self) -> None:
         """Re-run the first-run check on demand, and say what it found either way.
@@ -1465,6 +1750,59 @@ class MainWindow(QMainWindow):
             QPushButton#helpButton:menu-indicator {{
                 image: none;
                 width: 0px;
+            }}
+            QFrame#updateToast {{
+                /* The corner notice for a release that already exists.  It sits
+                   on top of the card, so it needs a fill and a border of its
+                   own or it reads as text that appeared out of nowhere.  The
+                   wording on it is deliberately flat: a release being available
+                   is a fact, not an event. */
+                background: {colors['surface']};
+                border: 1px solid {colors['border']};
+                border-radius: 10px;
+            }}
+            QLabel#updateToastHeading {{
+                color: {colors['text']};
+                font-weight: 700;
+            }}
+            QLabel#updateToastDetail {{
+                color: {colors['text']};
+            }}
+            QLabel#updateToastNote {{
+                color: {colors['muted']};
+            }}
+            QPushButton#updateToastClose {{
+                /* A drawn cross rather than a native one, so it reads as part
+                   of the notice instead of as a window button. */
+                background: transparent;
+                border: none;
+                border-radius: 4px;
+                color: {colors['muted']};
+                min-height: 18px;
+                padding: 0 4px;
+            }}
+            QPushButton#updateToastClose:hover {{
+                background: {colors['button_hover']};
+                color: {colors['text']};
+            }}
+            QPushButton#updateToastOpen {{
+                /* Shown at the same weight as Download so it is clearly the
+                   thing to press, and coloured like it for the same reason -
+                   but it opens a web page and nothing else. */
+                background: {colors['primary']};
+                color: {colors['primary_text']};
+                border: 1px solid {colors['primary']};
+                border-radius: 6px;
+                padding: 6px 12px;
+                font-weight: 600;
+            }}
+            QPushButton#updateToastOpen:hover {{
+                background: {colors['primary_hover']};
+                border-color: {colors['primary_hover']};
+            }}
+            QPushButton#updateToastOpen:pressed {{
+                background: {colors['primary_hover']};
+                color: {colors['primary_text']};
             }}
             QTableWidget#PlaylistTable,
             QTableWidget#QueueTable {{
@@ -3084,11 +3422,18 @@ class MainWindow(QMainWindow):
         # treat a finished check as a finished download and report "Download
         # complete" with no file to show.
         if isinstance(result, UpdateCheck):
+            automatic = self._update_check_automatic
+            self._update_check_automatic = False
             self._set_busy(False)
-            self.progress_bar.setRange(0, 100)
-            self.progress_bar.setValue(100)
-            self._progress_value = 100
-            self._report_update(result)
+            if not automatic:
+                # The manual check put the bar into its indeterminate state at
+                # the start and has to put it back.  An automatic one never
+                # touched it, and filling it here would be the program
+                # reporting progress on a job that was invisible by design.
+                self.progress_bar.setRange(0, 100)
+                self.progress_bar.setValue(100)
+                self._progress_value = 100
+            self._report_update(result, automatic=automatic)
             return
 
         self._set_busy(False, "Download complete")
@@ -3324,6 +3669,20 @@ class MainWindow(QMainWindow):
         return f"{minutes:d}:{seconds:02d}"
 
     def _on_job_failed(self, error: Any) -> None:
+        # Consumed first, so a failure cannot leave the *next* check - which
+        # the person asked for from the Help menu - reporting as though the
+        # program had raised its hand on its own.
+        automatic = self._update_check_automatic
+        self._update_check_automatic = False
+        if automatic:
+            # `check_for_updates` documents that it never raises and turns
+            # every failure into a result, so this should be unreachable.  It
+            # is handled anyway because the promise of an automatic check is
+            # that it cannot interrupt anybody, and an unattended modal dialog
+            # is precisely that.
+            _LOGGER.info("automatic_update_check_failed category=%s", type(error).__name__)
+            self._set_busy(False)
+            return
         self._set_busy(False, "Operation failed")
         self.progress_bar.setRange(0, 100)
         if isinstance(error, AppError):
@@ -3334,6 +3693,7 @@ class MainWindow(QMainWindow):
     def _on_job_cancelled(self) -> None:
         # A stop that was asked for by Pause still ends as a cancellation as far
         # as the worker is concerned; only the wording differs, and only here.
+        self._update_check_automatic = False
         paused = self._pausing
         self._pausing = False
         if paused:
@@ -3420,4 +3780,9 @@ class MainWindow(QMainWindow):
                 )
                 event.ignore()
                 return
+        # Only once the close is actually going ahead: a refused close leaves
+        # the window up, and the check should still be waiting for it.
+        self._update_check_timer.stop()
+        if self._update_toast is not None:
+            self._update_toast.hide()
         event.accept()

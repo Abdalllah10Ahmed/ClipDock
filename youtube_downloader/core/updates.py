@@ -8,10 +8,19 @@ program's whole job is running a third party's code against arbitrary input, so
 module produces is a version string and a link to a web page the user can read
 before deciding anything.
 
-The check is on demand.  ClipDock does not contact GitHub when it starts,
-because a network request nobody asked for is a decision the user did not make,
-and because an offline machine has to launch normally rather than present a
-connectivity problem as if it were an application problem.
+The check is asked for two ways.  The Help menu asks it, because someone who
+wants to know should be able to.  ClipDock also asks it once on its own,
+about eight seconds after the window appears: at most once a day, and only
+while the automatic check is switched on - and that switch lives in the same
+menu, because a network request nobody can refuse is not a request, it is a
+decision somebody else made for them.
+
+The automatic half is silent by design.  It says nothing when this is
+already the latest release, and nothing when GitHub could not be reached,
+because an offline machine has to launch normally rather than present a
+connectivity problem as if it were an application problem.  It speaks only
+when there is a release to name, and what it shows is a link to a web page -
+never a download, and never an installer.
 """
 
 from __future__ import annotations
