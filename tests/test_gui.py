@@ -20,6 +20,7 @@ from PySide6.QtGui import QColor, QIcon, QImage, QPalette, QPixmap, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QPushButton
 
+from youtube_downloader.core import history
 from youtube_downloader.core.binaries import find_icon, require_ffmpeg
 from youtube_downloader.core.errors import CancelledError, DependencyError
 from youtube_downloader.core.updates import RELEASES_URL, UpdateCheck
@@ -420,6 +421,18 @@ class GuiSmokeTests(unittest.TestCase):
         self.addCleanup(setattr, main_window, "read_settings", original_read)
         self.addCleanup(setattr, main_window, "write_setting", original_write)
         self.settings_path = settings_path
+        # The same for the history.  It is reached the other way round - the
+        # window does not hold the path, it calls `record_job`, which asks the
+        # history module where it lives - so the module attribute itself is
+        # swapped rather than the name imported into `main_window`.  Swapping
+        # the name there would leave `read_history` reading the developer's own
+        # file while the test wrote to a different one, and a test that passes
+        # while the two disagree is worse than no test at all.
+        history_path = Path(directory.name) / "history.json"
+        original_history = history.default_history_path
+        history.default_history_path = lambda: history_path
+        self.addCleanup(setattr, history, "default_history_path", original_history)
+        self.history_path = history_path
 
     def test_window_constructs_without_network(self) -> None:
         window = MainWindow(FakeEngine())
@@ -2342,7 +2355,8 @@ class GuiSmokeTests(unittest.TestCase):
 
     def test_resume_re_runs_the_job_that_was_paused(self) -> None:
         # The stored request is used rather than the settings now on screen,
-        # because it is the only record of how the download was being made.
+        # because it is the only record a re-run can drive; `history.json`
+        # writes what a job was made with too, and nothing reads it back.
         # A second run is allowed to finish so the whole round trip is visible:
         # stopped, offered, re-run, finished.
         engine = PausingEngine(stops=1)
@@ -2457,6 +2471,302 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertNotIn(format_size(12_000_000), leaner)
         window.close()
         self.app.processEvents()
+
+    # ------------------------------------------------------------------ history
+
+    def _open_window(self, engine) -> MainWindow:
+        """A shown window whose worker and history window are both closed for us.
+
+        Registered before anything is started, so a failure part-way through
+        cannot leave a thread spinning and the suite hanging instead of
+        reporting - the same reason `_pause_window` cleans up the way it does.
+        """
+        window = MainWindow(engine)
+        window.show()
+        self.app.processEvents()
+
+        def close() -> None:
+            if window.controller.is_running:
+                window.controller.cancel()
+                self._wait_for_job(window)
+            if window._history_window is not None:
+                window._history_window.close()
+            window.close()
+            self.app.processEvents()
+
+        self.addCleanup(close)
+        return window
+
+    def _one_finished_download(
+        self,
+        window: MainWindow,
+        directory: str,
+        url: str = "https://youtu.be/id",
+    ) -> None:
+        window.url_edit.setText(url)
+        window._fetch_details()
+        self._wait_for_job(window)
+        window.destination_edit.setText(directory)
+        window._start_download()
+        self._wait_for_job(window)
+
+    def test_a_finished_download_is_written_to_the_history_file(self) -> None:
+        window = self._open_window(FakeEngine())
+        with tempfile.TemporaryDirectory() as directory:
+            self._one_finished_download(window, directory)
+
+            jobs = history.read_history(self.history_path)
+            self.assertEqual(len(jobs), 1)
+            job = jobs[0]
+            self.assertEqual(job["mode"], "video")
+            self.assertEqual(job["outcome"], history.OUTCOME_COMPLETE)
+            self.assertEqual(job["succeeded"], 1)
+            self.assertEqual(job["failed"], 0)
+            self.assertEqual(job["folder"], str(Path(directory)))
+            # The header of a job says when it ran, and there is no second
+            # chance to ask once the job is over.
+            self.assertTrue(job["started"])
+
+            (item,) = job["items"]
+            self.assertEqual(item["title"], "A test video")
+            self.assertEqual(item["destination"], str(Path(directory) / "downloaded.mp4"))
+            self.assertEqual(item["url"], "https://youtu.be/id")
+            self.assertEqual(item["outcome"], history.ITEM_SAVED)
+
+            # The choices the job ran with are kept for a later "get it again",
+            # even though the window never shows them.
+            self.assertEqual(job["request"]["output_dir"], directory)
+            self.assertEqual(job["request"]["mode"], "video")
+            self.assertNotIn("info", job["request"])
+
+    def test_reading_a_videos_details_is_not_recorded_as_a_download(self) -> None:
+        # A probe produces details, not files.  A history that listed links the
+        # person never got would answer "what did I get" with things they do not
+        # have, so the guard is `_active_request`, which only a real job sets.
+        window = self._open_window(FakeEngine())
+        window.url_edit.setText("https://youtu.be/id")
+        window._fetch_details()
+        self._wait_for_job(window)
+
+        self.assertEqual(history.read_history(self.history_path), [])
+
+    def test_an_update_check_is_never_written_into_the_history(self) -> None:
+        window = self._open_window(FakeEngine())
+        with tempfile.TemporaryDirectory() as directory:
+            self._one_finished_download(window, directory)
+            self.assertEqual(len(history.read_history(self.history_path)), 1)
+
+            with patch("youtube_downloader.gui.main_window.QMessageBox"):
+                window._on_job_succeeded(
+                    UpdateCheck(status="current", current="0.2.0", latest=None)
+                )
+
+            # Not added, and the job that had just finished is not re-recorded
+            # or counted twice by it either.
+            self.assertEqual(len(history.read_history(self.history_path)), 1)
+
+    def test_a_failure_after_a_download_is_not_filed_as_a_second_job(self) -> None:
+        window = self._open_window(FakeEngine())
+        with tempfile.TemporaryDirectory() as directory:
+            self._one_finished_download(window, directory)
+            self.assertEqual(len(history.read_history(self.history_path)), 1)
+
+            # The next thing to fail is a probe, which has no request of its
+            # own.  Without the guard this would be filed as another attempt at
+            # the download that just finished, and the history would claim two
+            # jobs where one happened.
+            with patch("youtube_downloader.gui.main_window.QMessageBox"):
+                window._on_job_failed(RuntimeError("no network"))
+
+            self.assertEqual(len(history.read_history(self.history_path)), 1)
+
+    def test_a_paused_download_is_recorded_as_a_stop_and_not_a_failure(self) -> None:
+        engine = PausingEngine()
+        window = self._pause_window(engine)
+        window.url_edit.setText("https://youtu.be/id")
+        window._fetch_details()
+        self._wait_for_job(window)
+        with tempfile.TemporaryDirectory() as directory:
+            window.destination_edit.setText(directory)
+            window._start_download()
+            # PausingEngine blocks until it is cancelled, which is what makes it
+            # pauseable at all: there is nothing to wait for here.
+            self.assertTrue(window.controller.is_running)
+            window.pause_button.click()
+            self._wait_for_job(window)
+
+        jobs = history.read_history(self.history_path)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["outcome"], history.OUTCOME_PAUSED)
+        self.assertEqual(jobs[0]["succeeded"], 0)
+        self.assertEqual(jobs[0]["failed"], 0)
+        # The stop is written before Resume is offered, so a person who closes
+        # the window instead of continuing still has the record of it.
+        (item,) = jobs[0]["items"]
+        self.assertEqual(item["outcome"], history.ITEM_STOPPED)
+
+    def test_the_history_button_sits_with_the_action_buttons_and_always_works(self) -> None:
+        window = self._open_window(FakeEngine())
+        container = window.retry_button.parentWidget()
+        self.assertIs(window.history_button.parentWidget(), container)
+        self.assertTrue(window.history_button.isVisibleTo(window))
+
+        # Found in the layout rather than assumed from the source, because the
+        # point of the decision is where it actually ends up: beside Retry, on
+        # the left of the stretch, with the other action buttons and not with
+        # Download and Cancel on the right.
+        row = None
+        layout = container.layout()
+        for index in range(layout.count()):
+            item = layout.itemAt(index)
+            child = item.layout() if item is not None else None
+            if child is not None and child.indexOf(window.retry_button) >= 0:
+                row = child
+                break
+        self.assertIsNotNone(row)
+        self.assertEqual(row.indexOf(window.history_button), row.indexOf(window.resume_button) + 1)
+        self.assertLess(row.indexOf(window.history_button), row.indexOf(window.pause_button))
+
+        # Retry is dead until something has failed.  History answers on the very
+        # first launch, when the answer is "nothing yet".
+        self.assertFalse(window.retry_button.isEnabled())
+        self.assertTrue(window.history_button.isEnabled())
+
+    def test_the_history_window_groups_a_job_and_lists_its_files_underneath(self) -> None:
+        window = self._open_window(FakeEngine())
+        with tempfile.TemporaryDirectory() as directory:
+            self._one_finished_download(window, directory)
+            window._show_history()
+            view = window._history_window
+
+            self.assertEqual(view.tree.topLevelItemCount(), 1)
+            top = view.tree.topLevelItem(0)
+            self.assertIn("Video", top.text(1))
+            self.assertIn("https://youtu.be/id", top.text(1))
+            self.assertIn("Complete", top.text(2))
+            self.assertIn("1 file saved", top.text(2))
+            self.assertTrue(top.text(0), "the job header says when it ran")
+            self.assertEqual(top.text(3), str(Path(directory)))
+
+            self.assertEqual(top.childCount(), 1)
+            child = top.child(0)
+            self.assertEqual(child.text(1), "A test video")
+            self.assertIn("Saved", child.text(2))
+            self.assertEqual(child.text(3), str(Path(directory) / "downloaded.mp4"))
+
+            self.assertEqual(view.summary_label.text(), "1 job recorded · newest first")
+            self.assertTrue(view.tree.isVisible())
+            self.assertFalse(view.empty_label.isVisible())
+
+    def test_the_newest_job_is_open_and_older_ones_are_folded(self) -> None:
+        window = self._open_window(FakeEngine())
+        with tempfile.TemporaryDirectory() as directory:
+            for url in ("https://youtu.be/one", "https://youtu.be/two"):
+                self._one_finished_download(window, directory, url=url)
+            window._show_history()
+            view = window._history_window
+
+            self.assertEqual(view.tree.topLevelItemCount(), 2)
+            # The newest has a question attached to it - "what did I just get"
+            # - and is open.  An old one is folded, so a history nobody is
+            # looking at is not drawn in full every time it is opened.
+            self.assertTrue(view.tree.topLevelItem(0).isExpanded())
+            self.assertFalse(view.tree.topLevelItem(1).isExpanded())
+
+    def test_a_row_offers_its_folder_and_a_source_link_that_must_be_https(self) -> None:
+        # Written straight into the file: this is a rule about what a row is
+        # willing to do, and it holds for anything a hand-edited history can
+        # contain as much as for anything the program wrote itself.  `http` is
+        # recorded last so that it is the newest job, and therefore the first
+        # row the window shows.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        folder = Path(directory.name)
+        folder.mkdir(exist_ok=True)
+        for marker, url in (("https", "https://secure.example/watch"), ("http", "http://insecure.example/watch")):
+            history.record_job(
+                {
+                    "started": f"2026-10-07T09:{marker[:2]}:00",
+                    "finished": "2026-10-07T09:10:00",
+                    "mode": "video",
+                    "requested": url,
+                    "folder": str(folder),
+                    "outcome": "complete",
+                    "reason": "",
+                    "succeeded": 1,
+                    "failed": 0,
+                    "total": 1,
+                    "items": [
+                        {
+                            "title": marker,
+                            "destination": str(folder / f"{marker}.mp4"),
+                            "outcome": "saved",
+                            "reason": "",
+                            "url": url,
+                        }
+                    ],
+                    "request": {},
+                },
+                self.history_path,
+            )
+
+        window = self._open_window(FakeEngine())
+        window._show_history()
+        view = window._history_window
+        self.assertEqual(view.tree.topLevelItemCount(), 2)
+
+        newest, older = view.tree.topLevelItem(0), view.tree.topLevelItem(1)
+        self.assertEqual(newest.child(0).text(1), "http")
+
+        view.tree.setCurrentItem(newest.child(0))
+        self.assertTrue(view.folder_button.isEnabled())
+        self.assertFalse(
+            view.link_button.isEnabled(),
+            "a link handed to the browser on the user's behalf is https or nothing",
+        )
+
+        view.tree.setCurrentItem(older.child(0))
+        self.assertTrue(view.folder_button.isEnabled())
+        self.assertTrue(view.link_button.isEnabled())
+
+        with patch("youtube_downloader.gui.history_window.QDesktopServices") as desktop:
+            view.open_folder()
+        desktop.openUrl.assert_called_once()
+
+    def test_clearing_the_history_asks_first_and_then_empties_the_file(self) -> None:
+        window = self._open_window(FakeEngine())
+        history.record_job({"started": "2026-10-07T09:00:00", "items": []}, self.history_path)
+        window._show_history()
+        view = window._history_window
+        self.assertEqual(view.tree.topLevelItemCount(), 1)
+
+        # Asked for because it cannot be undone.
+        with patch("youtube_downloader.gui.history_window.QMessageBox") as boxes:
+            boxes.question.return_value = boxes.StandardButton.No
+            view._clear()
+        self.assertEqual(len(history.read_history(self.history_path)), 1)
+        self.assertEqual(view.tree.topLevelItemCount(), 1)
+
+        with patch("youtube_downloader.gui.history_window.QMessageBox") as boxes:
+            boxes.question.return_value = boxes.StandardButton.Yes
+            view._clear()
+        self.assertEqual(history.read_history(self.history_path), [])
+        self.assertEqual(view.tree.topLevelItemCount(), 0)
+        self.assertTrue(view.empty_label.isVisible())
+        self.assertFalse(view.clear_button.isEnabled())
+
+    def test_closing_the_main_window_closes_the_history_too(self) -> None:
+        # A child left open keeps the application running after the only window
+        # anybody is using has gone.
+        window = self._open_window(FakeEngine())
+        window._show_history()
+        view = window._history_window
+        self.app.processEvents()
+        self.assertTrue(view.isVisible())
+
+        window.close()
+        self.app.processEvents()
+        self.assertFalse(view.isVisible())
 
     @staticmethod
     def _wait_for_job(window: MainWindow) -> None:

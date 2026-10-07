@@ -3,7 +3,7 @@ from __future__ import annotations
 import ctypes
 import logging
 from ctypes import wintypes
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,13 @@ from ..core.engine import (
     unfinished_downloads,
 )
 from ..core.errors import AppError
+from ..core.history import (
+    OUTCOME_CANCELLED,
+    OUTCOME_FAILED,
+    OUTCOME_PAUSED,
+    build_job,
+    record_job,
+)
 from ..core.logging_setup import get_logger
 from ..core.models import (
     MAX_SUBTITLE_LANGUAGES,
@@ -83,6 +90,7 @@ from ..core.urls import UrlValidationError, normalize_youtube_playlist_url, norm
 from . import caption
 from .caption import CaptionButton
 from .dependencies import DependencyDialog, checked_devices
+from .history_window import HistoryWindow
 from .selectors import SelectorComboBox
 from .themes import DEFAULT_THEME, THEMES, THEME_IDS, is_dark, theme_palette
 from .workers import JobController
@@ -251,19 +259,29 @@ class MainWindow(QMainWindow):
         self._last_failed_queue: tuple[str, ...] = ()
         # Pause and Resume, and the three facts each one needs.
         #
-        # `_active_request` and `_active_operation` are the only record of *how*
-        # to continue a download: a `.part` file carries no link, and the
-        # settings file remembers UI preferences, never a job, so nothing
-        # reconstructs a request once the program is closed.  `_resume_snapshot`
-        # is what makes Resume's count honest -- a folder can hold leftovers from
-        # an earlier session, and offering to continue those as though they were
-        # the job just stopped would be the wrong count in a new place.
+        # `_active_request` and `_active_operation` are the only record that can
+        # still *drive* a download: a `.part` file carries no link, the settings
+        # file remembers UI preferences and never a job, and `history.json` now
+        # writes what each job was made with but is never read back to rebuild
+        # one.  So nothing reconstructs a request once the program is closed.
+        # `_resume_snapshot` is what makes Resume's count honest -- a folder can
+        # hold leftovers from an earlier session, and offering to continue those
+        # as though they were the job just stopped would be the wrong count in a
+        # new place.
         self._pauseable = False
         self._pausing = False
         self._active_request: Any = None
         self._active_operation: Any = None
         self._paused_request: Any = None
         self._resume_snapshot: dict[str, tuple[tuple[str, ...], int | None]] = {}
+        # The history, and the one fact a record needs that no result carries:
+        # when the job it describes began.  A result says what arrived; the
+        # header of a job says how long that took, and there is no second chance
+        # to ask once the job is over.  Both are written on the way out of a
+        # finished job and then cleared, so a later probe cannot be filed as a
+        # download it was not.
+        self._history_window: HistoryWindow | None = None
+        self._job_started: str = ""
         # The automatic update check, and the one piece of state it needs.
         #
         # Both the manual Help-menu check and this one produce an UpdateCheck
@@ -1363,6 +1381,14 @@ class MainWindow(QMainWindow):
             "the file continues from its saved pieces rather than from the exact byte."
         )
         self.pause_button.setEnabled(False)
+        # History sits beside Retry rather than in the Help menu because the two
+        # are asked at the same moment: Retry is "how do I not throw away the
+        # last forty minutes", History is "what did I already get".  It is
+        # always available, unlike Retry, because there is always an answer -
+        # including the empty one.
+        self.history_button = QPushButton("History")
+        self.history_button.setObjectName("History")
+        self.history_button.setToolTip("Show every finished job, grouped, with its files beneath it")
         self.download_button = QPushButton("Download")
         self.download_button.setObjectName("Download")
         self.download_button.setEnabled(False)
@@ -1372,6 +1398,7 @@ class MainWindow(QMainWindow):
         action_row.addWidget(self.play_button)
         action_row.addWidget(self.retry_button)
         action_row.addWidget(self.resume_button)
+        action_row.addWidget(self.history_button)
         action_row.addStretch(1)
         action_row.addWidget(self.pause_button)
         action_row.addWidget(self.cancel_button)
@@ -1827,6 +1854,31 @@ class MainWindow(QMainWindow):
             QTableWidget#QueueTable::item:disabled {{
                 color: {colors['disabled_text']};
             }}
+            QTreeWidget#HistoryTree {{
+                background: {colors['input']};
+                alternate-background-color: {colors['surface']};
+                color: {colors['text']};
+                border: 1px solid {colors['border']};
+                border-radius: 6px;
+                outline: 0;
+            }}
+            QTreeWidget#HistoryTree::item {{
+                padding: 3px 4px;
+                border: none;
+            }}
+            QTreeWidget#HistoryTree::item:selected {{
+                background: {colors['primary']};
+                color: {colors['primary_text']};
+            }}
+            QLabel#historyHeading {{
+                color: {colors['text']};
+                font-size: 18px;
+                font-weight: 700;
+            }}
+            QLabel#historySummary,
+            QLabel#historyEmpty {{
+                color: {colors['muted']};
+            }}
             QCheckBox {{
                 color: {colors['text']};
                 spacing: 8px;
@@ -2081,6 +2133,7 @@ class MainWindow(QMainWindow):
         self.play_button.clicked.connect(self._play_last_file)
         self.retry_button.clicked.connect(self._retry_failed_items)
         self.resume_button.clicked.connect(self._resume_paused_job)
+        self.history_button.clicked.connect(self._show_history)
         self.controller.progress.connect(self._on_progress)
         self.controller.succeeded.connect(self._on_job_succeeded)
         self.controller.failed.connect(self._on_job_failed)
@@ -3163,6 +3216,10 @@ class MainWindow(QMainWindow):
         self._active_request = request
         self._active_operation = operation
         self._paused_request = None
+        # When the job began, because a result says what arrived and nothing
+        # else remembers how long that took.  Taken here rather than when the
+        # result lands: there is no second chance to ask a job that is over.
+        self._job_started = datetime.now().isoformat(timespec="seconds")
         # Taken before the first byte rather than read afterwards: the pieces
         # this job adds are the only evidence of which leftovers it owns, and
         # there is no second chance to look at the folder as it was.
@@ -3251,6 +3308,12 @@ class MainWindow(QMainWindow):
         self._paused_request = None
         self._pausing = False
         self._pauseable = True
+        # The continuing job is the running job from here.  `_active_request`
+        # was consumed when Pause reported the stop, so without this a second
+        # pause would store whatever was in the field last, and the history of
+        # what this job does would have no request to write down.
+        self._active_request = request
+        self._job_started = datetime.now().isoformat(timespec="seconds")
         self._set_busy(True, "Continuing the download that was paused…")
         self._reset_progress_display()
         self.controller.start(operation)
@@ -3385,6 +3448,10 @@ class MainWindow(QMainWindow):
             return
 
         if isinstance(result, PlaylistDownloadResult):
+            # Recorded before the summary is built rather than after it, so a
+            # wording bug in the status line cannot cost the record of what was
+            # actually downloaded.
+            self._record_history(result)
             self._set_busy(False, "Playlist download complete")
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(100)
@@ -3411,6 +3478,7 @@ class MainWindow(QMainWindow):
             return
 
         if isinstance(result, QueueDownloadResult):
+            self._record_history(result)
             self._set_busy(False, "Batch download complete")
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(100)
@@ -3436,6 +3504,12 @@ class MainWindow(QMainWindow):
             self._report_update(result, automatic=automatic)
             return
 
+        # The fall-through.  Everything with its own branch above returned, so
+        # this is a single-file download - or, if a result type is ever added
+        # without one, a job that still has to be written down and has to stop
+        # being the active one, which `_record_history` does whether or not
+        # there is anything it can list.
+        self._record_history(result)
         self._set_busy(False, "Download complete")
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
@@ -3540,6 +3614,69 @@ class MainWindow(QMainWindow):
         # A batch may have saved many files; the first one is the sensible
         # default because it is the first link the user listed.
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(playable[0])))
+
+    def _show_history(self) -> None:
+        """Open the history window, or bring it back to the front.
+
+        One window is kept rather than made per click: a second copy would read
+        the same file and disagree with the first about what was selected, and
+        there is no question it would answer that the first does not.
+        """
+
+        if self._history_window is None:
+            self._history_window = HistoryWindow(self)
+        # Re-read on every opening rather than caching.  The file is small, it
+        # is the only record, and a window that showed what the file said ten
+        # minutes ago would be the same lie as not writing it down at all.
+        self._history_window.refresh()
+        self._history_window.show()
+        self._history_window.raise_()
+        self._history_window.activateWindow()
+
+    def _refresh_history_if_open(self) -> None:
+        """Follow a job that finishes while the history is on screen.
+
+        Only when it is visible: rebuilding a list nobody is looking at is work
+        done for no one, and the next `_show_history` re-reads the file anyway.
+        """
+
+        if self._history_window is not None and self._history_window.isVisible():
+            self._history_window.refresh()
+
+    def _record_history(self, result: Any, *, outcome: str = "", reason: str = "") -> None:
+        """Write one finished download down.
+
+        Called from the result handlers, which are also reached by probes and
+        update checks - so the guard is `_active_request`, which only a real
+        download job ever sets.  It is consumed rather than read, which is what
+        keeps a failed probe that follows a download from being filed as a
+        second attempt at that download.
+
+        This never raises and never reports.  The record is written on the way
+        out of a job that has already happened, so a log file that could not be
+        written must not be the reason the result goes unreported; a failure
+        here is logged and the window moves on.
+        """
+
+        request = self._active_request
+        if request is None:
+            return
+        self._active_request = None
+        started = self._job_started
+        self._job_started = ""
+        try:
+            job = build_job(request, result, started=started, outcome=outcome, reason=reason)
+        except Exception as error:  # pragma: no cover - build_job is defensive
+            _LOGGER.error("history_build_failed exception=%s", type(error).__name__)
+            return
+        if not job:
+            return
+        try:
+            record_job(job)
+        except Exception as error:  # pragma: no cover - record_job does not raise
+            _LOGGER.error("history_record_failed exception=%s", type(error).__name__)
+            return
+        self._refresh_history_if_open()
 
     def _refresh_retry_button(self) -> None:
         """Name the Retry button after what it would actually retry.
@@ -3685,6 +3822,18 @@ class MainWindow(QMainWindow):
             return
         self._set_busy(False, "Operation failed")
         self.progress_bar.setRange(0, 100)
+        # Written before `_show_error`, because that opens a modal and waits to
+        # be dismissed.  A history entry that waited on a click would be a
+        # record of the error depending on how long somebody took to read it.
+        self._record_history(
+            None,
+            outcome=OUTCOME_FAILED,
+            reason=(
+                error.message
+                if isinstance(error, AppError)
+                else "An unexpected error stopped the operation."
+            ),
+        )
         if isinstance(error, AppError):
             self._show_error("Operation failed", error.message)
         else:
@@ -3696,6 +3845,20 @@ class MainWindow(QMainWindow):
         self._update_check_automatic = False
         paused = self._pausing
         self._pausing = False
+        # A Pause is a job that stopped and may be continued; a Cancel is one
+        # that stopped and will not be.  Both are written down, because a
+        # download that ran for ten minutes and then stopped is exactly the
+        # thing somebody wants to see accounted for later, and neither can be
+        # listed file by file - nothing here watched which files this job owns.
+        #
+        # The reasons are written to sit *after* the outcome rather than repeat
+        # it: the row already says "Paused" or "Cancelled", so a reason that
+        # began "Stopped..." would be the same sentence twice.
+        self._record_history(
+            None,
+            outcome=OUTCOME_PAUSED if paused else OUTCOME_CANCELLED,
+            reason="the pieces already written were kept" if paused else "",
+        )
         if paused:
             self._set_busy(False, "Paused - what had downloaded so far is kept")
         else:
@@ -3785,4 +3948,8 @@ class MainWindow(QMainWindow):
         self._update_check_timer.stop()
         if self._update_toast is not None:
             self._update_toast.hide()
+        # The history is a child window, and a child left open keeps the
+        # application running after the only window anybody is using has gone.
+        if self._history_window is not None:
+            self._history_window.close()
         event.accept()
