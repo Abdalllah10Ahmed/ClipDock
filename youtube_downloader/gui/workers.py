@@ -62,6 +62,35 @@ class JobWorker(QObject):
             self.succeeded.emit(result)
 
 
+class _ProgressForwarder(QObject):
+    """Carry one worker's progress to the main thread, owner included.
+
+    ``JobWorker.progress`` is emitted from yt-dlp's own fragment threads rather
+    than from the thread the worker lives in, and a signal connected to a plain
+    callable only runs when that worker thread's event loop gets to it -- which
+    is after ``JobWorker.run`` has returned, because the job occupies the loop
+    for its whole duration.  Measured on a real download: an event emitted at
+    9.667 s was relayed at 20.683 s, the instant the job ended, so the bar
+    received the entire history of the download in one burst and nothing
+    before it.  A slot on a QObject owned by the main thread is delivered
+    there instead, while the job is still running (same measurement, emitted
+    4.012 s and delivered 4.031 s), which is where the progress bar is.
+
+    The forwarder belongs to a single job on purpose: it is what
+    ``JobController._relay_progress`` is handed, so a late event from a
+    superseded worker is still recognisable as one and can be dropped.
+    """
+
+    def __init__(self, controller: JobController, owner: JobWorker) -> None:
+        super().__init__(controller)
+        self._controller = controller
+        self._owner = owner
+
+    @Slot(object)
+    def forward(self, event: object) -> None:
+        self._controller._relay_progress(self._owner, event)
+
+
 class JobController(QObject):
     progress = Signal(object)
     succeeded = Signal(object)
@@ -73,6 +102,7 @@ class JobController(QObject):
         super().__init__(parent)
         self._thread: QThread | None = None
         self._worker: JobWorker | None = None
+        self._forwarder: _ProgressForwarder | None = None
 
     @property
     def is_running(self) -> bool:
@@ -90,9 +120,14 @@ class JobController(QObject):
         self._worker = worker
 
         thread.started.connect(worker.run)
-        # The worker is captured rather than recovered with QObject.sender(),
-        # which is not exposed to Python here and would raise NameError.
-        worker.progress.connect(lambda event, owner=worker: self._relay_progress(owner, event))
+        # The worker is captured by a forwarder on this controller's thread
+        # rather than by a lambda here, because a plain callable would be run
+        # on the worker's own thread, whose event loop the job is occupying --
+        # see _ProgressForwarder.  The forwarder also carries the owner, which
+        # QObject.sender() cannot: it is not exposed to Python in PySide6
+        # 6.11.2 and raises NameError.
+        self._forwarder = _ProgressForwarder(self, worker)
+        worker.progress.connect(self._forwarder.forward)
         worker.succeeded.connect(self._on_succeeded)
         worker.failed.connect(self._on_failed)
         worker.cancelled.connect(self._on_cancelled)
@@ -105,12 +140,15 @@ class JobController(QObject):
     def _relay_progress(self, owner: JobWorker, event: object) -> None:
         """Forward a worker's progress, unless that worker has been superseded.
 
-        This runs in the emitting worker's thread, so by the time it is reached
-        ``self._worker`` is already the newer job if one has started.  Dropping
-        the event here is what stops the progress bar pinning itself: a value
-        from a finished operation that arrives after the next operation reset
-        the bar is not a retry reporting fewer bytes, and treating it as one
-        clamps every later value to 100.
+        The owner is passed as an argument rather than recovered with
+        ``QObject.sender()``, which is not exposed to Python in PySide6
+        6.11.2, and this runs on the main thread together with ``start``,
+        which is what sets ``self._worker``: a superseding job is therefore
+        already visible here when one has begun.  Dropping the old worker's
+        event is what stops the progress bar pinning itself -- a value from a
+        finished operation that arrives after the next operation reset the bar
+        is not a retry reporting fewer bytes, and treating it as one clamps
+        every later value to 100.
         """
 
         if self._worker is not None and self._worker is not owner:
@@ -146,4 +184,11 @@ class JobController(QObject):
         # signal races with queued QThread teardown in some PySide6 builds.
         self._thread = None
         self._worker = None
+        forwarder = self._forwarder
+        self._forwarder = None
+        if forwarder is not None:
+            # Every progress event was posted to this thread before the job
+            # returned, and QThread.finished is posted after it, so nothing is
+            # still on its way to a forwarder that is about to go.
+            forwarder.deleteLater()
         self.finished.emit()

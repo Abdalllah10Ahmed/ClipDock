@@ -527,13 +527,27 @@ class Engine:
             progress.check_cancelled()
             status = data.get("status")
             if status == "downloading":
-                total = data.get("total_bytes") or data.get("total_bytes_estimate")
+                total = data.get("total_bytes")
+                estimated = total is None
+                if estimated:
+                    total = data.get("total_bytes_estimate")
                 downloaded = data.get("downloaded_bytes") or 0
                 percent = None
                 try:
                     if total:
                         percent = float(downloaded) / float(total) * 100
                 except (TypeError, ValueError, ZeroDivisionError):
+                    percent = None
+                # Before a fragment download has completed its first fragment,
+                # yt-dlp's estimate is only the size of the fragment it is
+                # reading, so it reports a finished file (downloaded equals the
+                # estimate) before anything meaningful has landed.  An estimate
+                # that claims the whole file while the download is still
+                # running is not a number worth showing: the bar treats it as a
+                # floor and pins itself there.  Measured at
+                # ``downloaded_bytes 712, total_bytes_estimate 712`` on the
+                # first hook of a real run.
+                if estimated and percent is not None and percent >= 100.0:
                     percent = None
                 progress.emit(
                     "downloading",
