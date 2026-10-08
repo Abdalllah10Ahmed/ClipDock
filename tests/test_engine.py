@@ -32,6 +32,7 @@ from youtube_downloader.core.models import (
     PlaylistDownloadRequest,
     PlaylistMedia,
     PlaylistQuality,
+    ProgressEvent,
     QueueDownloadRequest,
     StreamPreference,
     SubtitleFormat,
@@ -984,6 +985,37 @@ class EngineTests(unittest.TestCase):
         relay.emit("completed", 100.0, "Download complete", force=True)
         self.assertEqual(len(events), 2)
         self.assertEqual(events[-1].percent, 100.0)
+
+    def test_a_fragment_estimate_equal_to_the_bytes_read_is_not_a_percentage(self) -> None:
+        # yt-dlp's first fragment hook reports an estimate equal to the bytes it
+        # just read - measured on a real download at 712 of 712 - which is 100%
+        # before anything has finished.  Reported as a number, the bar adopts
+        # it as a floor and pins itself there for the whole run.  An estimate
+        # that claims completion while the download is still going is not a
+        # percentage worth showing.
+        engine = Engine(ffmpeg_path=Path("ffmpeg.exe"))
+        seen: list[ProgressEvent] = []
+        hook = engine._yt_dlp_progress_hook(_ProgressRelay(seen.append, lambda: False))
+        with patch("youtube_downloader.core.engine.time.monotonic", side_effect=[10.0, 10.2]):
+            hook(
+                {
+                    "status": "downloading",
+                    "downloaded_bytes": 712,
+                    "total_bytes": None,
+                    "total_bytes_estimate": 712,
+                }
+            )
+            hook(
+                {
+                    "status": "downloading",
+                    "downloaded_bytes": 1736,
+                    "total_bytes": None,
+                    "total_bytes_estimate": 43_788,
+                }
+            )
+        self.assertEqual(len(seen), 2)
+        self.assertIsNone(seen[0].percent, "the degenerate estimate must not report 100%")
+        self.assertAlmostEqual(seen[1].percent, 1736 / 43_788 * 100, places=4)
 
     def test_video_download_selects_requested_quality_and_outputs_mp4(self) -> None:
         info = self.engine.probe("https://youtu.be/video123")

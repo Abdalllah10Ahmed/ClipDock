@@ -4,6 +4,8 @@ import dataclasses
 import json
 import os
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -671,6 +673,62 @@ class GuiSmokeTests(unittest.TestCase):
         current._emit_progress(ProgressEvent("downloading", 33.0, "Downloading media"))
         self.app.processEvents()
         self.assertEqual(window.progress_bar.value(), 33)
+        window.close()
+        self.app.processEvents()
+
+    def test_progress_emitted_from_another_thread_arrives_while_the_job_runs(self) -> None:
+        # The fake engines used elsewhere emit progress from the worker's own
+        # thread, so a queued-signal delay never shows up there.  Real yt-dlp
+        # emits from its own fragment thread pool (`concurrent_fragment_downloads`
+        # is 4 in the engine), and a signal connected to a plain lambda is only
+        # delivered once the job slot returns -- measured on a real download at
+        # an event that took 9.667 s to be emitted and 20.683 s to be relayed.
+        # The forwarder has to deliver it to the main thread while the job is
+        # still running.  Emitting from a `ThreadPoolExecutor` thread is exactly
+        # what the old and the new wiring disagree about, so this is the test
+        # that would have caught the regression.
+        window = MainWindow(FakeEngine())
+        window._reset_progress_display()
+        job_returned = threading.Event()
+        received: list[tuple[object, bool]] = []
+        window.controller.progress.connect(
+            lambda event: received.append((event, job_returned.is_set()))
+        )
+
+        def operation(progress, cancel) -> object:  # noqa: ANN001
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                pool.submit(
+                    lambda: progress(ProgressEvent("downloading", 42.0, "Downloading media"))
+                ).result()
+            # Hold the job's own thread open long enough for the main thread to
+            # run: with the old wiring nothing arrives until this returns, which
+            # is exactly what the assertion below is meant to catch.
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline and not received:
+                time.sleep(0.02)
+            job_returned.set()
+            return None
+
+        window.controller.start(operation)
+        end = time.monotonic() + 6.0
+        while time.monotonic() < end and not received:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertTrue(received, "progress emitted from another thread never reached the bar")
+        self.assertFalse(
+            received[0][1],
+            "the first event arrived only after the job returned; the download "
+            "would show a dead bar and then be flooded by it at the end",
+        )
+        # `worker.succeeded` is wired to `thread.quit`, which arrives through
+        # the main-thread event loop, so wait for the job by pumping events
+        # rather than blocking on QThread.wait(); blocking here stalls the very
+        # event that ends the job.
+        end = time.monotonic() + 10.0
+        while time.monotonic() < end and window.controller.is_running:
+            self.app.processEvents()
+            time.sleep(0.02)
+        self.assertFalse(window.controller.is_running, "the job did not finish")
         window.close()
         self.app.processEvents()
 
