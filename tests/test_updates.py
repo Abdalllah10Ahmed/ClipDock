@@ -1,19 +1,31 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import tempfile
 import unittest
 import urllib.error
+from pathlib import Path
+from unittest.mock import patch
 
 from youtube_downloader.core import updates
+from youtube_downloader.core.errors import CancelledError, DownloadFailure
+from youtube_downloader.core.models import ProgressEvent
 from youtube_downloader.core.updates import (
     CURRENT,
+    INSTALLER_ASSET_NAME,
     LATEST_RELEASE_API,
+    MAX_INSTALLER_BYTES,
     NEWER,
+    RELEASE_DOWNLOAD_PREFIX,
     RELEASES_URL,
     UNKNOWN,
+    DownloadedUpdate,
     UpdateCheck,
     check_for_updates,
+    download_update,
     is_newer,
+    launch_installer,
     parse_version,
 )
 
@@ -53,6 +65,79 @@ def raising(error: Exception):
 
 def release(tag: str, url: str = "https://github.com/x/y/releases/tag/v9") -> bytes:
     return json.dumps({"tag_name": tag, "html_url": url}).encode()
+
+
+def release_with_asset(
+    body: bytes,
+    *,
+    name: str = INSTALLER_ASSET_NAME,
+    url: str | None = None,
+    size: int | None = None,
+    digest: str | None = None,
+) -> bytes:
+    asset: dict[str, object] = {
+        "name": name,
+        "browser_download_url": url or f"{RELEASE_DOWNLOAD_PREFIX}v9.9.9/{INSTALLER_ASSET_NAME}",
+        "size": len(body) if size is None else size,
+    }
+    if digest is not None:
+        asset["digest"] = digest
+    return json.dumps(
+        {
+            "tag_name": "v9.9.9",
+            "html_url": "https://github.com/x/y/releases/tag/v9.9.9",
+            "assets": [asset],
+        }
+    ).encode()
+
+
+class _Headers:
+    def __init__(self, content_length: int | None) -> None:
+        self._content_length = content_length
+
+    def get(self, name: str, default: object = None) -> object:
+        if name.lower() == "content-length" and self._content_length is not None:
+            return str(self._content_length)
+        return default
+
+
+class DownloadResponse:
+    """The part of a release-asset response the downloader actually uses."""
+
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        url: str = "https://objects.githubusercontent.com/asset",
+        content_length: int | None = None,
+    ) -> None:
+        self._body = body
+        self.headers = _Headers(len(body) if content_length is None else content_length)
+        self._url = url
+
+    def read(self, size: int) -> bytes:
+        chunk, self._body = self._body[:size], self._body[size:]
+        return chunk
+
+    def geturl(self) -> str:
+        return self._url
+
+    def __enter__(self) -> "DownloadResponse":
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+
+def installer_check(body: bytes, *, size: int | None = None, digest: str = "") -> UpdateCheck:
+    return UpdateCheck(
+        status=NEWER,
+        current="0.1.0",
+        latest="v9.9.9",
+        installer_url=f"{RELEASE_DOWNLOAD_PREFIX}v9.9.9/{INSTALLER_ASSET_NAME}",
+        installer_size=len(body) if size is None else size,
+        installer_digest=digest,
+    )
 
 
 class VersionTests(unittest.TestCase):
@@ -170,34 +255,217 @@ class ResultTests(unittest.TestCase):
         self.assertIn("github+json", request.get_header("Accept"))
 
 
-class ReportOnlyTests(unittest.TestCase):
-    """Pins the decision that this module reports and never installs.
+class DownloadableTests(unittest.TestCase):
+    """Pins the boundary around downloading and running an update.
 
-    There is no code path here for an update to be fetched, so this is about the
-    module's whole surface rather than any one function: the only addresses it
-    knows are the releases page and the endpoint that describes it.  A change
-    that adds a second address has to come here and argue with this.
+    The module now knows three addresses - the releases page, the endpoint that
+    describes it, and the download path an installer must come from - and the
+    last one is a prefix, not a page.  An asset on any other host is refused at
+    the point it is read, so a tampered reply cannot point the download
+    somewhere else.
     """
 
-    def test_the_only_addresses_in_the_module_are_the_releases_page_and_its_api(self) -> None:
+    def test_the_only_addresses_in_the_module_are_the_releases_page_its_api_and_the_download_path(self) -> None:
         addresses = {
             value
             for name, value in vars(updates).items()
             if not name.startswith("_") and isinstance(value, str) and value.startswith("http")
         }
-        self.assertEqual(addresses, {RELEASES_URL, LATEST_RELEASE_API})
+        self.assertEqual(
+            addresses,
+            {RELEASES_URL, LATEST_RELEASE_API, RELEASE_DOWNLOAD_PREFIX},
+        )
 
-    def test_the_result_carries_no_payload_a_downloader_could_use(self) -> None:
-        # A version, a status, a reason, and a page.  There is no field that
-        # could hold an installer or a download URL handed over as trusted.
+    def test_the_result_describes_the_installer_without_being_able_to_hold_bytes(self) -> None:
+        # A version, a status, a reason, a page, and the identity of one asset.
+        # There is still no field that could carry an installer's contents, and
+        # nothing here starts a download by itself.
         self.assertEqual(
             {field.name for field in UpdateCheck.__dataclass_fields__.values()},
-            {"status", "current", "latest", "release_url", "reason"},
+            {
+                "status",
+                "current",
+                "latest",
+                "release_url",
+                "reason",
+                "installer_url",
+                "installer_size",
+                "installer_digest",
+            },
         )
         for field in UpdateCheck.__dataclass_fields__.values():
             with self.subTest(field=field.name):
                 self.assertNotIn("bytes", field.type)
                 self.assertNotIn("Path", str(field.type))
+
+    def test_a_release_without_the_installer_offers_no_install(self) -> None:
+        result = check_for_updates("0.1.0", opener=replying(release("v9.9.9")))
+        self.assertTrue(result.available)
+        self.assertFalse(result.can_install)
+        self.assertEqual(result.installer_url, "")
+
+    def test_the_published_installer_is_described_with_its_size_and_checksum(self) -> None:
+        body = b"installer"
+        digest = hashlib.sha256(body).hexdigest()
+        result = check_for_updates(
+            "0.1.0",
+            opener=replying(release_with_asset(body, digest=f"sha256:{digest.upper()}")),
+        )
+        self.assertTrue(result.can_install)
+        self.assertEqual(result.installer_size, len(body))
+        self.assertEqual(result.installer_digest, f"sha256:{digest}")
+
+    def test_an_installer_on_another_host_is_ignored(self) -> None:
+        result = check_for_updates(
+            "0.1.0",
+            opener=replying(
+                release_with_asset(
+                    b"installer",
+                    url=f"https://example.test/{INSTALLER_ASSET_NAME}",
+                )
+            ),
+        )
+        self.assertFalse(result.can_install)
+
+    def test_an_asset_with_another_name_is_ignored(self) -> None:
+        result = check_for_updates(
+            "0.1.0",
+            opener=replying(release_with_asset(b"installer", name="SomethingElse.exe")),
+        )
+        self.assertFalse(result.can_install)
+
+    def test_an_installer_larger_than_the_cap_is_ignored(self) -> None:
+        result = check_for_updates(
+            "0.1.0",
+            opener=replying(release_with_asset(b"installer", size=MAX_INSTALLER_BYTES + 1)),
+        )
+        self.assertFalse(result.can_install)
+
+    def test_a_checksum_that_is_not_sha256_is_not_claimed_to_be_one(self) -> None:
+        result = check_for_updates(
+            "0.1.0",
+            opener=replying(release_with_asset(b"installer", digest="sha512:abc")),
+        )
+        self.assertEqual(result.installer_digest, "")
+
+
+class DownloadTests(unittest.TestCase):
+    def test_the_installer_is_written_and_verified(self) -> None:
+        body = b"a real installer"
+        digest = hashlib.sha256(body).hexdigest()
+        events: list[ProgressEvent] = []
+        with tempfile.TemporaryDirectory() as directory:
+            result = download_update(
+                installer_check(body, digest=f"sha256:{digest}"),
+                Path(directory),
+                progress=events.append,
+                opener=lambda *a, **k: DownloadResponse(body),
+            )
+            self.assertIsInstance(result, DownloadedUpdate)
+            self.assertEqual(result.version, "v9.9.9")
+            self.assertEqual(result.path, Path(directory) / INSTALLER_ASSET_NAME)
+            self.assertEqual(result.path.read_bytes(), body)
+            self.assertFalse((Path(directory) / f"{INSTALLER_ASSET_NAME}.part").exists())
+        self.assertTrue(events)
+        self.assertEqual(events[-1].message, "Downloading the ClipDock update")
+
+    def test_a_checksum_mismatch_is_refused_and_nothing_is_left_behind(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(DownloadFailure) as caught:
+                download_update(
+                    installer_check(b"installer", digest=f"sha256:{'0' * 64}"),
+                    Path(directory),
+                    opener=lambda *a, **k: DownloadResponse(b"installer"),
+                )
+            self.assertIn("checksum", caught.exception.message)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_a_short_or_long_body_is_refused(self) -> None:
+        for body in (b"short", b"much longer than declared"):
+            with self.subTest(body=body):
+                with tempfile.TemporaryDirectory() as directory:
+                    with self.assertRaises(DownloadFailure):
+                        download_update(
+                            installer_check(body, size=len(body) + 1),
+                            Path(directory),
+                            opener=lambda *a, **k: DownloadResponse(body),
+                        )
+                    self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_cancelling_deletes_the_partial_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(CancelledError):
+                download_update(
+                    installer_check(b"installer"),
+                    Path(directory),
+                    cancel_check=lambda: True,
+                    opener=lambda *a, **k: DownloadResponse(b"installer"),
+                )
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_a_redirect_away_from_github_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(DownloadFailure) as caught:
+                download_update(
+                    installer_check(b"installer"),
+                    Path(directory),
+                    opener=lambda *a, **k: DownloadResponse(
+                        b"installer", url="https://example.test/evil.exe"
+                    ),
+                )
+            self.assertIn("redirected away", caught.exception.message)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_a_check_that_names_no_installer_downloads_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(DownloadFailure):
+                download_update(
+                    UpdateCheck(status=NEWER, current="0.1.0", latest="v9.9.9"),
+                    Path(directory),
+                )
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_a_url_outside_the_projects_download_path_is_refused_before_opening(self) -> None:
+        opened: list[object] = []
+        check = UpdateCheck(
+            status=NEWER,
+            current="0.1.0",
+            latest="v9.9.9",
+            installer_url="https://example.test/ClipDock-Setup.exe",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(DownloadFailure):
+                download_update(
+                    check,
+                    Path(directory),
+                    opener=lambda *a, **k: opened.append(a) or DownloadResponse(b"x"),
+                )
+        self.assertEqual(opened, [])
+
+
+class LauncherTests(unittest.TestCase):
+    def test_the_installer_is_started_silently_and_never_restarts_the_machine(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / INSTALLER_ASSET_NAME
+            path.write_bytes(b"installer")
+            with patch.object(updates.subprocess, "Popen") as popen:
+                self.assertTrue(launch_installer(path))
+        popen.assert_called_once()
+        self.assertEqual(
+            popen.call_args.args[0],
+            [str(path), "/SILENT", "/NORESTART"],
+        )
+
+    def test_a_missing_installer_is_not_reported_as_started(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertFalse(launch_installer(Path(directory) / INSTALLER_ASSET_NAME))
+
+    def test_a_launch_that_raises_is_reported_rather_than_escaping(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / INSTALLER_ASSET_NAME
+            path.write_bytes(b"installer")
+            with patch.object(updates.subprocess, "Popen", side_effect=OSError("nope")):
+                self.assertFalse(launch_installer(path))
 
 
 class ApiShapeTests(unittest.TestCase):

@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Windows / Python 3.14
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      PYTHONIOENCODING: utf-8
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install the pinned runtime dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      # The test suite exercises real FFmpeg for the media pipeline, so a
+      # checkout without vendor\ is not the same suite.  The cache key is the
+      # SHA-256 pins themselves: if a pin changes, the archive is fetched again
+      # and verified rather than trusted.
+      - name: Restore the fetched Windows binaries
+        uses: actions/cache@v4
+        with:
+          path: vendor
+          key: vendor-${{ runner.os }}-${{ hashFiles('tools/fetch_dependencies.py', 'youtube_downloader/core/dependencies.py') }}
+
+      - name: Fetch and verify the Windows binaries
+        run: python tools/fetch_dependencies.py
+
+      # A developer machine with QT_QPA_FONTDIR set renders differently; the
+      # suite has been bitten by that.  A clean runner has no such variable,
+      # but the step makes that a fact rather than an assumption.
+      - name: Remove any inherited font override
+        shell: pwsh
+        run: if (Test-Path Env:QT_QPA_FONTDIR) { Remove-Item Env:QT_QPA_FONTDIR }
+
+      - name: Run the test suite
+        shell: pwsh
+        run: |
+          python -u -m unittest discover -s tests -t . 2>&1 | Tee-Object -FilePath suite.log
+          exit $LASTEXITCODE
+
+      - name: Keep the suite log when it fails
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: suite-log
+          path: suite.log
+          if-no-files-found: ignore

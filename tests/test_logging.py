@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import errno
 import logging
 import tempfile
 import unittest
 from pathlib import Path
 
-from youtube_downloader.core.errors import classify_yt_dlp_message
+from youtube_downloader.core.errors import (
+    classify_yt_dlp_message,
+    friendly_error,
+    safe_log_error,
+)
 from youtube_downloader.core.logging_setup import SafeYtDlpLogger, configure_logging
 
 # What yt-dlp actually said during the 25-language run that wrote 0 of 25 files.
@@ -52,6 +57,44 @@ class ClassifiedReasonTests(unittest.TestCase):
         self.assertEqual(reason, "rate_limited")
         for fragment in ("youtube.com", "dQw4w9WgXcQ", "429:"):
             self.assertNotIn(fragment, reason)
+
+    def test_a_refused_media_request_is_explained_as_a_stale_link(self) -> None:
+        mapped = friendly_error(
+            RuntimeError("unable to download video data: HTTP Error 403: Forbidden")
+        )
+        self.assertEqual(mapped.code, "download_failed")
+        self.assertIn("403", mapped.message)
+        self.assertIn("Fetch the video details again", mapped.message)
+
+    def test_a_reset_socket_is_a_network_fault_not_a_disk_problem(self) -> None:
+        # `ConnectionResetError` has no space in its class name, so the text
+        # vocabulary does not see it; without the errno branch it was reported
+        # as "the file could not be written".
+        mapped = friendly_error(OSError(errno.ECONNRESET, "socket closed"))
+        self.assertEqual(mapped.code, "network_failure")
+
+
+class OperationFailureLogTests(unittest.TestCase):
+    def test_a_failed_operation_records_the_closed_set_reason(self) -> None:
+        logger = logging.getLogger("test.safe.operation")
+        logger.setLevel(logging.ERROR)
+        logger.propagate = False
+        with self.assertLogs(logger, level="ERROR") as caught:
+            safe_log_error(
+                logger,
+                RuntimeError(
+                    "Unable to download webpage: HTTP Error 503: Service Unavailable "
+                    "(https://www.youtube.com/watch?v=dQw4w9WgXcQ)"
+                ),
+                operation="probe",
+            )
+        line = caught.output[0]
+        self.assertIn("operation=probe", line)
+        self.assertIn("category=network_failure", line)
+        self.assertIn("reason=network_failure", line)
+        self.assertIn("exception=RuntimeError", line)
+        self.assertNotIn("dQw4w9WgXcQ", line)
+        self.assertNotIn("https://", line)
 
 
 class SafeLoggerTests(unittest.TestCase):

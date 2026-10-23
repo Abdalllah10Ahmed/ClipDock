@@ -31,11 +31,14 @@ that can list qualities and sizes; only merging and conversion are unavailable.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import logging
 import os
 import shutil
+import ssl
 import subprocess
 import tempfile
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -539,22 +542,140 @@ def _report(progress: Callable[[object], None], downloaded: int, total: int, not
     progress({"kind": "dependency_progress", "note": note, "done": downloaded, "total": total, "percent": percent})
 
 
+# A 171 MB download over a home connection will occasionally lose its socket,
+# and the failure reaches this module as an `OSError` from `connection.read`,
+# never as an `HTTPError`.  One attempt turned every one of those into "check
+# the internet connection" even when the connection was fine.  Three attempts
+# with short waits is the difference between a download and a support message.
+_DOWNLOAD_RETRY_WAITS = (2.0, 6.0)
+
+# Only causes another attempt can change.  A 404 means the pinned link is gone
+# and a certificate failure will be identical next time, so both are reported
+# immediately instead of making the person wait for the same answer twice.
+_RETRYABLE_DOWNLOAD_REASONS = frozenset(
+    {"rate_limited", "server_error", "timeout", "unreachable", "download_failed"}
+)
+
+
+def _download_failure(error: BaseException) -> tuple[str, str]:
+    """Return a closed-set reason and the sentence the person should read.
+
+    Telling a refused request, a certificate intercepted by a proxy and a
+    dropped connection apart is the point: the old single sentence sent all
+    three to "check the internet connection", which for two of them was the one
+    thing already working.  The reason also decides whether a retry is offered.
+    """
+
+    if isinstance(error, urllib.error.HTTPError):
+        status = error.code
+        if status == 429:
+            return (
+                "rate_limited",
+                "The FFmpeg download server asked this computer to slow down (HTTP 429). "
+                "Wait a few minutes and try again.",
+            )
+        if 500 <= status <= 599:
+            return (
+                "server_error",
+                f"The FFmpeg download server failed to answer (HTTP {status}). The connection "
+                "is fine; the server is not. Try again in a few minutes.",
+            )
+        if status == 404:
+            return (
+                "not_found",
+                "The FFmpeg download link no longer exists. Update ClipDock to get a current one.",
+            )
+        if status in {401, 403}:
+            return (
+                "refused",
+                f"The FFmpeg download server refused the request (HTTP {status}). This is not "
+                "an internet-connection problem; try again, and if it persists, update ClipDock.",
+            )
+        return (
+            "http_error",
+            f"The FFmpeg download server answered with HTTP {status} instead of the file.",
+        )
+
+    cause = getattr(error, "reason", error)
+    text = f"{type(cause).__name__} {cause}".lower()
+    if isinstance(cause, ssl.SSLError) or "certificate" in text or "ssl" in text:
+        return (
+            "tls_failure",
+            "ClipDock could not establish a secure connection to the FFmpeg download server. "
+            "A proxy, antivirus, or the system certificate store may be intercepting it - the "
+            "internet connection itself can be fine.",
+        )
+    if isinstance(cause, TimeoutError) or "timed out" in text:
+        return (
+            "timeout",
+            "The FFmpeg download timed out before it finished. Check the connection and try again.",
+        )
+    if isinstance(error, urllib.error.URLError):
+        return (
+            "unreachable",
+            "The FFmpeg download server could not be reached. Check the internet connection and try again.",
+        )
+    return (
+        "download_failed",
+        "The FFmpeg download stopped before it finished. Check the internet connection and try again.",
+    )
+
+
+def _wait_before_retry(seconds: float, is_cancelled: Callable[[], bool]) -> None:
+    """Sleep in short steps so Cancel during the wait takes effect at once."""
+
+    deadline = time.monotonic() + seconds
+    while True:
+        if is_cancelled():
+            raise CancelledError()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.25, remaining))
+
+
 def _download_archive(
     destination: Path,
     progress: Callable[[object], None],
     is_cancelled: Callable[[], bool],
 ) -> None:
-    request = urllib.request.Request(FFMPEG_URL, headers={"User-Agent": f"ClipDock/{__version__}"})
-    try:
-        connection = urllib.request.urlopen(request, timeout=60)
-    except (urllib.error.URLError, OSError) as error:
-        # Recorded by category and not by message: the message can contain the
-        # URL, and records are not allowed to contain local paths or addresses.
-        _LOGGER.warning("dependency_download_failed category=%s", type(error).__name__)
-        raise DependencyError(
-            "FFmpeg could not be downloaded. Check the internet connection and try again."
-        ) from error
+    for attempt in range(len(_DOWNLOAD_RETRY_WAITS) + 1):
+        try:
+            _download_archive_once(destination, progress, is_cancelled)
+            return
+        except CancelledError:
+            raise
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as error:
+            reason, message = _download_failure(error)
+            # Recorded by category and reason, not by message: the message can
+            # contain the URL, and records are not allowed to contain local
+            # paths or addresses.
+            _LOGGER.warning(
+                "dependency_download_failed category=%s reason=%s attempt=%d",
+                type(error).__name__,
+                reason,
+                attempt + 1,
+            )
+            if reason not in _RETRYABLE_DOWNLOAD_REASONS or attempt >= len(_DOWNLOAD_RETRY_WAITS):
+                raise DependencyError(message) from error
+            wait = _DOWNLOAD_RETRY_WAITS[attempt]
+            _report(
+                progress,
+                0,
+                FFMPEG_DOWNLOAD_BYTES,
+                f"Downloading FFmpeg - connection lost, retrying in {int(wait)}s "
+                f"(attempt {attempt + 2} of {len(_DOWNLOAD_RETRY_WAITS) + 1})",
+            )
+            _wait_before_retry(wait, is_cancelled)
 
+
+def _download_archive_once(
+    destination: Path,
+    progress: Callable[[object], None],
+    is_cancelled: Callable[[], bool],
+) -> None:
+    request = urllib.request.Request(FFMPEG_URL, headers={"User-Agent": f"ClipDock/{__version__}"})
+    connection = urllib.request.urlopen(request, timeout=60)
     written = 0
     with connection:
         total = int(connection.headers.get("Content-Length") or FFMPEG_DOWNLOAD_BYTES)

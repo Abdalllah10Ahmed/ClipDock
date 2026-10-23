@@ -12,10 +12,13 @@ from urllib.parse import parse_qs, urlsplit
 
 from youtube_downloader.core.engine import (
     CLEAN_OUTTMPL,
+    FETCH_RETRY_ATTEMPTS,
     ID_OUTTMPL,
+    STAGING_DIRNAME,
     Engine,
     _ProgressRelay,
     _retry_backoff,
+    detect_js_runtimes,
     item_slice_progress,
     playlist_audio_size_bytes,
     playlist_video_size_bytes,
@@ -24,7 +27,13 @@ from youtube_downloader.core.engine import (
     select_playlist_videos,
     unfinished_downloads,
 )
-from youtube_downloader.core.errors import CancelledError, DownloadFailure, ExtractionError, friendly_error
+from youtube_downloader.core.errors import (
+    CancelledError,
+    DownloadFailure,
+    ExtractionError,
+    UnsupportedContentError,
+    friendly_error,
+)
 from youtube_downloader.core.models import (
     MAX_SUBTITLE_LANGUAGES,
     DownloadMode,
@@ -104,6 +113,22 @@ def expand_template(template: str, title: str, video_id: str, extension: str) ->
     ):
         name = name.replace(field, value)
     return name
+
+
+def _resolved_template(options: dict) -> str:
+    """The template as a full path, the way yt-dlp resolves `paths.home`.
+
+    The engine hands over a *relative* template on purpose -- yt-dlp only
+    honours `paths` while the template is relative, and that is what keeps
+    partial files out of the destination folder -- so a fake that used the raw
+    value would write into whatever directory the test runner was started in.
+    """
+
+    template = options["outtmpl"]["default"]
+    home = (options.get("paths") or {}).get("home")
+    if home and not Path(template).is_absolute():
+        return str(Path(home) / template)
+    return template
 
 
 class FakeYdl:
@@ -214,7 +239,7 @@ class FakeYdl:
             data.update(self.__class__.caption_tracks)
             return data
         self.downloaded = True
-        template = self.options["outtmpl"]["default"]
+        template = _resolved_template(self.options)
         base = Path(expand_template(template, "Example video", "video123", "mp4")).with_suffix("")
         if self.options.get("skip_download"):
             # A caption run writes one file per language and saves no media.
@@ -448,7 +473,7 @@ class FakePlaylistYdl:
             return data
         self.download_order.append(video_id)
         self._emit_progress()
-        template = self.options["outtmpl"]["default"]
+        template = _resolved_template(self.options)
         wants_audio = any(
             isinstance(item, dict) and item.get("key") == "FFmpegExtractAudio"
             for item in (self.options.get("postprocessors") or [])
@@ -507,7 +532,7 @@ class FakeStreamYdl:
                 ],
             }
         self.downloaded = True
-        template = self.options["outtmpl"]["default"]
+        template = _resolved_template(self.options)
         base = Path(template).parent / "Stream comparison [streams]"
         output = base.with_suffix(".mp4")
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -694,16 +719,30 @@ class UnfinishedDownloadTests(unittest.TestCase):
         self.assertEqual(len(found), 1)
         self.assertIsNone(found[0].total_bytes, "an unmeasured piece must not be summed as zero")
 
-    def test_the_parts_folder_is_not_where_an_interrupted_download_is_looked_for(self) -> None:
-        # The false premise, pinned.  `paths.temp` points at `.parts`, yt-dlp
-        # ignores it because the output template is absolute, and an interrupted
-        # run was measured leaving no such directory at all.  A `.parts` folder
-        # that happens to exist is therefore not treated as resumable content.
+    def test_the_staging_folder_is_where_a_new_interruption_is_found(self) -> None:
+        # This version downloads into a hidden staging folder, because yt-dlp
+        # honours `paths` while the output template is relative.  That is where
+        # a stopped download's pieces are now, and finding them there is what
+        # makes Resume possible after a restart.
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
-            parts = folder / ".parts"
-            parts.mkdir()
-            (parts / "leftover.mp4.part").write_bytes(b"x" * 10)
+            staging = folder / STAGING_DIRNAME
+            staging.mkdir()
+            (staging / "leftover.mp4.part").write_bytes(b"x" * 10)
+            (staging / "leftover.mp4.ytdl").write_bytes(b"i" * 5)
+            found = unfinished_downloads(folder)
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].target_name, "leftover.mp4")
+        self.assertEqual(found[0].total_bytes, 15)
+        self.assertTrue(found[0].has_fragments)
+
+    def test_a_finished_staging_folder_is_not_resumable(self) -> None:
+        # yt-dlp removes the pieces it moved into place; an empty staging folder
+        # is evidence of a finished job, not of a stopped one.
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            (folder / STAGING_DIRNAME).mkdir()
+            (folder / "Done.mp4").write_bytes(b"x" * 100)
             self.assertEqual(unfinished_downloads(folder), ())
 
 class FilenameTests(unittest.TestCase):
@@ -1015,7 +1054,44 @@ class EngineTests(unittest.TestCase):
             )
         self.assertEqual(len(seen), 2)
         self.assertIsNone(seen[0].percent, "the degenerate estimate must not report 100%")
-        self.assertAlmostEqual(seen[1].percent, 1736 / 43_788 * 100, places=4)
+        # A byte transfer owns only the first 95% of the bar; the final band
+        # belongs to the merge, which is what keeps 100% truthful.
+        self.assertAlmostEqual(seen[1].percent, 1736 / 43_788 * 95, places=4)
+
+    def test_a_second_stream_continues_the_bar_instead_of_reaching_one_hundred(self) -> None:
+        # The old defect: the video stream finished at "100%" and the bar pinned
+        # itself there for the whole audio download.  The streams are summed, so
+        # the first one ends near the top of the transfer band instead.
+        engine = Engine(ffmpeg_path=Path("ffmpeg.exe"))
+        seen: list[ProgressEvent] = []
+        hook = engine._yt_dlp_progress_hook(_ProgressRelay(seen.append, lambda: False))
+        with patch("youtube_downloader.core.engine.time.monotonic", side_effect=range(1000)):
+            hook({"status": "downloading", "filename": "video", "downloaded_bytes": 10_000_000, "total_bytes": 10_000_000})
+            hook({"status": "downloading", "filename": "audio", "downloaded_bytes": 1_000_000, "total_bytes": 2_000_000})
+            hook({"status": "downloading", "filename": "audio", "downloaded_bytes": 2_000_000, "total_bytes": 2_000_000})
+            hook({"status": "finished", "filename": "audio"})
+        percentages = [event.percent for event in seen]
+        self.assertTrue(all(value is not None for value in percentages))
+        self.assertEqual(percentages, sorted(percentages))
+        self.assertAlmostEqual(percentages[0], 95.0, places=4)
+        self.assertAlmostEqual(percentages[-1], 95.0, places=4)
+        self.assertTrue(all(value < 100.0 for value in percentages))
+
+    def test_postprocessing_owns_the_final_band_and_names_the_phase(self) -> None:
+        engine = Engine(ffmpeg_path=Path("ffmpeg.exe"))
+        seen: list[ProgressEvent] = []
+        hook = engine._postprocessor_hook(_ProgressRelay(seen.append, lambda: False))
+        hook({"status": "started", "postprocessor": "Merger"})
+        hook({"status": "processing", "postprocessor": "Merger"})
+        hook({"status": "finished", "postprocessor": "Merger"})
+        hook({"status": "started", "postprocessor": "MoveFiles"})
+        percentages = [event.percent for event in seen]
+        self.assertTrue(all(value is not None for value in percentages))
+        self.assertLess(percentages[0], 100.0)
+        self.assertLess(percentages[-1], 100.0)
+        self.assertEqual(percentages, sorted(percentages))
+        self.assertEqual(seen[0].message, "Merging audio and video")
+        self.assertEqual(seen[-1].message, "Finalizing file")
 
     def test_video_download_selects_requested_quality_and_outputs_mp4(self) -> None:
         info = self.engine.probe("https://youtu.be/video123")
@@ -2390,10 +2466,13 @@ class EngineTests(unittest.TestCase):
             )
         self.assertEqual(len(queued.saved), 1)
 
-    def test_javascript_challenge_error_is_explicit_without_adding_dependencies(self) -> None:
+    def test_javascript_challenge_error_points_at_a_runtime_without_adding_dependencies(self) -> None:
         mapped = friendly_error(RuntimeError("JsChallengeProviderRejectedRequest: remote component unavailable"))
         self.assertEqual(mapped.code, "missing_dependency")
-        self.assertIn("yt-dlp-ejs", mapped.message)
+        # The engine now passes any runtime the machine already has to yt-dlp,
+        # so the advice is an installation rather than "this cannot be done".
+        self.assertIn("JavaScript runtime", mapped.message)
+        self.assertIn("Node.js", mapped.message)
 
     def test_friendly_error_explains_network_and_storage_failures(self) -> None:
         network = friendly_error(RuntimeError("HTTP Error 503: Service Unavailable"))
@@ -2401,6 +2480,130 @@ class EngineTests(unittest.TestCase):
         storage = friendly_error(OSError(28, "No space left on device"))
         self.assertEqual(storage.code, "storage_error")
         self.assertIn("drive", storage.message.lower())
+
+
+class FlakyProbeYdl(FakeYdl):
+    """A YoutubeDL whose first few metadata requests fail and then succeed."""
+
+    failures_remaining = 0
+    failure_message = ""
+    probe_runs = 0
+
+    def extract_info(self, url: str, download: bool = False):
+        if not download:
+            type(self).probe_runs += 1
+            if type(self).failures_remaining > 0:
+                type(self).failures_remaining -= 1
+                raise RuntimeError(type(self).failure_message)
+        return super().extract_info(url, download)
+
+
+class FlakyPlaylistYdl(FakePlaylistYdl):
+    """The playlist counterpart, so a retry is observed on both probe paths."""
+
+    failures_remaining = 0
+    probe_runs = 0
+
+    def extract_info(self, url: str, download: bool = False):
+        if not download:
+            type(self).probe_runs += 1
+            if type(self).failures_remaining > 0:
+                type(self).failures_remaining -= 1
+                raise RuntimeError("Unable to download webpage: HTTP Error 503: Service Unavailable")
+        return super().extract_info(url, download)
+
+
+class JsRuntimeDetectionTests(unittest.TestCase):
+    def test_a_node_installation_is_offered_to_yt_dlp(self) -> None:
+        # yt-dlp's default is Deno only, so Node has to be named explicitly.
+        with patch(
+            "youtube_downloader.core.engine.shutil.which",
+            side_effect=lambda name: "C:/node/node.exe" if name == "node" else None,
+        ):
+            self.assertEqual(detect_js_runtimes(), {"node": {}})
+
+    def test_every_installed_runtime_is_offered(self) -> None:
+        # QuickJS registers under its runtime name but ships as `qjs`.
+        installed = {"deno", "node", "bun", "qjs"}
+        with patch(
+            "youtube_downloader.core.engine.shutil.which",
+            side_effect=lambda name: "somewhere" if name in installed else None,
+        ):
+            self.assertEqual(
+                detect_js_runtimes(),
+                {"deno": {}, "node": {}, "bun": {}, "quickjs": {}},
+            )
+
+    def test_without_a_runtime_the_default_is_left_in_place(self) -> None:
+        # Passing an empty mapping would *disable* yt-dlp's Deno default.
+        with patch("youtube_downloader.core.engine.shutil.which", return_value=None):
+            self.assertEqual(detect_js_runtimes(), {"deno": {}})
+
+    def test_the_youtube_dl_options_carry_the_detection(self) -> None:
+        engine = Engine(ydl_factory=FakeYdl, ffmpeg_path=Path("ffmpeg.exe"))
+        with patch(
+            "youtube_downloader.core.engine.shutil.which",
+            side_effect=lambda name: "C:/node/node.exe" if name == "node" else None,
+        ):
+            options = engine._base_options(Path.cwd(), _ProgressRelay(None, None))
+        self.assertEqual(options["js_runtimes"], {"node": {}})
+
+
+class FetchRetryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        FakeYdl.instances.clear()
+        FlakyProbeYdl.failures_remaining = 0
+        FlakyProbeYdl.failure_message = ""
+        FlakyProbeYdl.probe_runs = 0
+        FlakyPlaylistYdl.failures_remaining = 0
+        FlakyPlaylistYdl.probe_runs = 0
+        self.engine = Engine(ydl_factory=FlakyProbeYdl, ffmpeg_path=Path("ffmpeg.exe"))
+        self.playlist_engine = Engine(ydl_factory=FlakyPlaylistYdl, ffmpeg_path=Path("ffmpeg.exe"))
+
+    def _probe(self):
+        # Waiting is not what is under test, and the suite is long enough.
+        with patch.object(Engine, "_wait_before_retry", staticmethod(lambda *_args: None)):
+            return self.engine.probe("https://youtu.be/video123")
+
+    def _probe_playlist(self):
+        with patch.object(Engine, "_wait_before_retry", staticmethod(lambda *_args: None)):
+            return self.playlist_engine.probe_playlist("https://www.youtube.com/playlist?list=PL123")
+
+    def test_a_transient_fetch_failure_is_retried_by_itself(self) -> None:
+        # The reported defect: the first tap failed and a second tap worked.
+        # The second tap is now the engine's job.
+        FlakyProbeYdl.failures_remaining = 1
+        FlakyProbeYdl.failure_message = (
+            "Unable to download webpage: HTTP Error 503: Service Unavailable"
+        )
+        info = self._probe()
+        self.assertEqual(info.video_id, "video123")
+        self.assertEqual(FlakyProbeYdl.probe_runs, 2)
+
+    def test_a_network_failure_that_stays_down_is_reported_after_the_last_attempt(self) -> None:
+        FlakyProbeYdl.failures_remaining = FETCH_RETRY_ATTEMPTS + 5
+        FlakyProbeYdl.failure_message = (
+            "Unable to download webpage: HTTP Error 503: Service Unavailable"
+        )
+        with self.assertRaises(DownloadFailure) as caught:
+            self._probe()
+        self.assertEqual(caught.exception.code, "network_failure")
+        self.assertEqual(FlakyProbeYdl.probe_runs, FETCH_RETRY_ATTEMPTS)
+
+    def test_a_private_video_is_not_retried(self) -> None:
+        # A second attempt cannot change a decision about the video, and making
+        # someone wait for the same answer is worse than answering at once.
+        FlakyProbeYdl.failures_remaining = 9
+        FlakyProbeYdl.failure_message = "ERROR: This video is private"
+        with self.assertRaises(UnsupportedContentError):
+            self._probe()
+        self.assertEqual(FlakyProbeYdl.probe_runs, 1)
+
+    def test_a_playlist_fetch_is_retried_too(self) -> None:
+        FlakyPlaylistYdl.failures_remaining = 1
+        info = self._probe_playlist()
+        self.assertEqual(info.playlist_id, "PL123")
+        self.assertEqual(FlakyPlaylistYdl.probe_runs, 2)
 
 
 if __name__ == "__main__":

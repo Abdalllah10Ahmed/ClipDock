@@ -62,8 +62,11 @@ _YTDLP_REASON_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("verification_required", ("sign in to confirm", "login required", "sign in required", "confirm you are not a bot", "confirm you're not a bot")),
     ("cookies_required", ("use --cookies", "cookies from browser", "account cookies")),
     ("format_unavailable", ("requested format is not available", "no video formats", "no formats found")),
-    ("extractor_failure", ("unable to download webpage", "failed to parse", "unsupported url", "no suitable extractor")),
+    # A network cause is checked before the generic wrapper yt-dlp puts around
+    # it: "Unable to download webpage: HTTP Error 503" is a 503, and recording
+    # it as an extractor problem would send the next reader looking at yt-dlp.
     ("network_failure", ("timed out", "timeout", "connection reset", "connection refused", "temporary failure in name resolution", "network is unreachable", "getaddrinfo", "ssl", "remote end closed", "service unavailable", "http error 5", "http error 503")),
+    ("extractor_failure", ("unable to download webpage", "failed to parse", "unsupported url", "no suitable extractor")),
 )
 
 
@@ -147,7 +150,9 @@ def friendly_error(error: BaseException) -> AppError:
         return UnsupportedContentError("This video is protected and cannot be downloaded by this application.")
     if any(token in text for token in ("js challenge", "javascript challenge", "challenge solver", "challengeprovider", "jscallengeproviderrejectedrequest", "yt-dlp-ejs", "yt_dlp_ejs", "remote component")):
         return DependencyError(
-            "YouTube requires JavaScript challenge support for this video. The approved dependency set does not include yt-dlp-ejs or a bundled JavaScript runtime, so this video cannot be downloaded."
+            "YouTube needs a JavaScript runtime to verify this video. ClipDock does not bundle one, "
+            "but it uses Node.js, Deno, Bun or QuickJS when one is already installed - install Node.js "
+            "(the usual choice) and try again."
         )
     if "sign in to confirm" in text or ("bot" in text and "confirm" in text) or "login required" in text or "sign in required" in text:
         return DownloadFailure("YouTube asked for additional verification. This version does not use accounts or bypass that check.", code="verification_required")
@@ -155,6 +160,22 @@ def friendly_error(error: BaseException) -> AppError:
         return DependencyError("YouTube requires cookies for this video. This version does not store or use account cookies.", code="cookies_required")
     if "requested format is not available" in text or "no video formats" in text or "no formats" in text:
         return DownloadFailure("The selected quality is no longer available. Fetch the video details again and choose another option.", code="format_changed")
+    if "http error 403" in text or "403: forbidden" in text:
+        # A media URL carries a signature and an expiry; by the time a long
+        # download reaches for a later fragment the signature can be stale.
+        # Fetching the details again issues a fresh one, which is why the second
+        # tap used to work and is now the advice rather than a mystery.
+        return DownloadFailure(
+            "YouTube refused the media request (HTTP 403). Fetch the video details again and retry; "
+            "a partial download will continue from where it stopped.",
+            code="download_failed",
+        )
+    if "unable to download video data" in text or "unable to download audio" in text:
+        return DownloadFailure(
+            "YouTube stopped sending the media before the file was complete. "
+            "Fetch the video details again and retry; a partial download will continue.",
+            code="download_failed",
+        )
     if "unsupported url" in text or "no suitable extractor" in text:
         return ExtractionError("This link is not a supported YouTube video link.", code="unsupported_url")
     # The rate limit is deliberately absent here: it is classified above, so a
@@ -166,6 +187,20 @@ def friendly_error(error: BaseException) -> AppError:
 
     if isinstance(error, TimeoutError):
         return DownloadFailure("The operation timed out. Check the network connection and try again.", code="network_failure")
+    if isinstance(error, OSError) and error.errno in {
+        errno.ECONNRESET,
+        errno.ECONNREFUSED,
+        errno.ECONNABORTED,
+        errno.ETIMEDOUT,
+        errno.EHOSTUNREACH,
+        errno.ENETUNREACH,
+        errno.EPIPE,
+    }:
+        # A socket error is a dropped connection, not a folder that cannot be
+        # written.  `ConnectionResetError` has no space in its class name, so the
+        # text vocabulary above does not catch it; without this it was reported
+        # as a storage problem.
+        return DownloadFailure("The network connection was interrupted. Check the connection and try again; partial downloads may resume.", code="network_failure")
     if isinstance(error, OSError):
         return StorageError("The file could not be written. Check the destination folder and available disk space.")
     if error.__class__.__name__ in {"DownloadError", "ExtractorError", "YoutubeDLError"}:
@@ -175,4 +210,14 @@ def friendly_error(error: BaseException) -> AppError:
 
 def safe_log_error(logger: Any, error: BaseException, *, operation: str) -> None:
     mapped = friendly_error(error)
-    logger.error("operation_failed operation=%s category=%s exception=%s", operation, mapped.code, error.__class__.__name__)
+    # `reason` is the closed-set token from `classify_yt_dlp_message`, never the
+    # message itself.  Without it a log line said only "download_failed", which
+    # is the category that means "we could not tell"; the token is what makes
+    # the next report actionable without recording a title, URL or path.
+    logger.error(
+        "operation_failed operation=%s category=%s reason=%s exception=%s",
+        operation,
+        mapped.code,
+        classify_yt_dlp_message(str(error)),
+        error.__class__.__name__,
+    )

@@ -118,6 +118,24 @@ def _stand_in_archive(directory: Path, payload: bytes = b"MZ" + b"\x00" * 4096) 
     return archive
 
 
+class _PayloadResponse:
+    """The part of an HTTP response `_download_archive` actually reads."""
+
+    def __init__(self, payload: bytes) -> None:
+        self._payload = payload
+        self.headers = {"Content-Length": str(len(payload))}
+
+    def read(self, size: int = -1) -> bytes:
+        chunk, self._payload = self._payload[:size], self._payload[size:]
+        return chunk
+
+    def __enter__(self) -> "_PayloadResponse":
+        return self
+
+    def __exit__(self, *args: object) -> bool:
+        return False
+
+
 class DependencyReportTests(unittest.TestCase):
     def test_a_present_dependency_costs_nothing_to_report(self) -> None:
         reports = check_dependencies(lambda: Path("C:/somewhere/ffmpeg.exe"))
@@ -499,10 +517,11 @@ class InstallerTests(unittest.TestCase):
             raise urllib.error.URLError("no route to host")
 
         with patch.object(dependencies.urllib.request, "urlopen", refuse):
-            with self.assertRaises(DependencyError) as caught:
-                dependencies._download_archive(
-                    self.directory / "x.zip", lambda e: None, lambda: False
-                )
+            with patch.object(dependencies, "_DOWNLOAD_RETRY_WAITS", ()):
+                with self.assertRaises(DependencyError) as caught:
+                    dependencies._download_archive(
+                        self.directory / "x.zip", lambda e: None, lambda: False
+                    )
         self.assertIn("internet", caught.exception.message.lower())
 
     def test_the_download_request_identifies_the_current_version(self) -> None:
@@ -529,11 +548,109 @@ class InstallerTests(unittest.TestCase):
             raise urllib.error.URLError("the header was all this test wanted")
 
         with patch.object(dependencies.urllib.request, "urlopen", capture):
-            with self.assertRaises(DependencyError):
+            with patch.object(dependencies, "_DOWNLOAD_RETRY_WAITS", ()):
+                with self.assertRaises(DependencyError):
+                    dependencies._download_archive(
+                        self.directory / "x.zip", lambda e: None, lambda: False
+                    )
+        self.assertEqual(captured["agent"], f"ClipDock/{__version__}")
+
+    def test_a_dropped_connection_is_retried_and_can_succeed(self) -> None:
+        """The reported failure: the internet was fine, the download was not.
+
+        A reset arrives from ``connection.read`` as an ``OSError``, not as an
+        ``HTTPError``.  One attempt turned it into "check the internet
+        connection"; the retry is what turns it into a downloaded archive.
+        """
+
+        calls: list[int] = []
+
+        def flaky(request, *args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise ConnectionResetError(10054, "An existing connection was forcibly closed")
+            return _PayloadResponse(b"verified bytes")
+
+        destination = self.directory / "archive.zip"
+        events: list[dict] = []
+        with patch.object(dependencies.urllib.request, "urlopen", flaky):
+            with patch.object(dependencies, "_DOWNLOAD_RETRY_WAITS", (0.0, 0.0)):
+                dependencies._download_archive(destination, events.append, lambda: False)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(destination.read_bytes(), b"verified bytes")
+        self.assertTrue(any("retrying" in event["note"] for event in events))
+
+    def test_a_server_error_names_the_server_not_the_connection(self) -> None:
+        import urllib.error
+
+        calls: list[int] = []
+
+        def refuse(*args, **kwargs):
+            calls.append(1)
+            raise urllib.error.HTTPError(
+                dependencies.FFMPEG_URL, 503, "Service Unavailable", {}, None
+            )
+
+        with patch.object(dependencies.urllib.request, "urlopen", refuse):
+            with patch.object(dependencies, "_DOWNLOAD_RETRY_WAITS", (0.0, 0.0)):
+                with self.assertRaises(DependencyError) as caught:
+                    dependencies._download_archive(
+                        self.directory / "x.zip", lambda e: None, lambda: False
+                    )
+
+        message = caught.exception.message.lower()
+        self.assertEqual(len(calls), 3)
+        self.assertIn("http 503", message)
+        self.assertIn("server", message)
+        self.assertNotIn("check the internet connection", message)
+
+    def test_a_certificate_failure_is_named_as_a_secure_connection_problem(self) -> None:
+        import ssl
+        import urllib.error
+
+        calls: list[int] = []
+
+        def refuse(*args, **kwargs):
+            calls.append(1)
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError(1, "certificate verify failed")
+            )
+
+        with patch.object(dependencies.urllib.request, "urlopen", refuse):
+            with self.assertRaises(DependencyError) as caught:
                 dependencies._download_archive(
                     self.directory / "x.zip", lambda e: None, lambda: False
                 )
-        self.assertEqual(captured["agent"], f"ClipDock/{__version__}")
+
+        message = caught.exception.message.lower()
+        self.assertEqual(len(calls), 1, "a certificate failure will not fix itself")
+        self.assertIn("secure connection", message)
+        self.assertIn("proxy", message)
+        self.assertNotIn("check the internet connection", message)
+
+    def test_a_refused_request_is_reported_at_once_with_its_status(self) -> None:
+        import urllib.error
+
+        calls: list[int] = []
+
+        def refuse(*args, **kwargs):
+            calls.append(1)
+            raise urllib.error.HTTPError(
+                dependencies.FFMPEG_URL, 403, "Forbidden", {}, None
+            )
+
+        with patch.object(dependencies.urllib.request, "urlopen", refuse):
+            with self.assertRaises(DependencyError) as caught:
+                dependencies._download_archive(
+                    self.directory / "x.zip", lambda e: None, lambda: False
+                )
+
+        message = caught.exception.message.lower()
+        self.assertEqual(len(calls), 1)
+        self.assertIn("http 403", message)
+        self.assertIn("refused", message)
+        self.assertIn("not an internet-connection problem", message)
 
 
 class LookupOrderTests(unittest.TestCase):

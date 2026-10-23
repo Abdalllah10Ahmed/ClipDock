@@ -24,8 +24,8 @@ from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QPushButton
 
 from youtube_downloader.core import history
 from youtube_downloader.core.binaries import find_icon, require_ffmpeg
-from youtube_downloader.core.errors import CancelledError, DependencyError
-from youtube_downloader.core.updates import RELEASES_URL, UpdateCheck
+from youtube_downloader.core.errors import CancelledError, DependencyError, DownloadFailure
+from youtube_downloader.core.updates import RELEASES_URL, DownloadedUpdate, UpdateCheck
 
 from youtube_downloader.core.models import (
     DownloadMode,
@@ -48,6 +48,7 @@ from youtube_downloader.core.models import (
 )
 from youtube_downloader.gui import main_window
 from youtube_downloader.gui import caption
+from youtube_downloader.gui import history_window
 from youtube_downloader.gui.caption import CaptionButton
 from youtube_downloader.gui.main_window import (
     APP_NAME,
@@ -1466,6 +1467,61 @@ class GuiSmokeTests(unittest.TestCase):
             window.close()
             self.app.processEvents()
 
+    def test_installing_an_update_is_refused_while_a_download_is_running(self) -> None:
+        # Never interrupt a download: the installer is a second thing to fetch,
+        # and the progress bar and the engine already belong to the first.
+        window = MainWindow(FakeEngine())
+        self.addCleanup(window.close)
+        update = UpdateCheck(
+            status="newer",
+            current="0.3.0",
+            latest="v0.4.0",
+            installer_url=(
+                "https://github.com/x/y/releases/download/v0.4.0/ClipDock-Setup.exe"
+            ),
+            installer_size=1024,
+        )
+        started: list[object] = []
+        window.controller.start = started.append
+        with patch.object(
+            type(window.controller), "is_running", new_callable=PropertyMock, return_value=True
+        ), patch("youtube_downloader.gui.main_window.QMessageBox.information") as told:
+            window._install_update(update)
+        self.assertEqual(started, [])
+        told.assert_called_once()
+        self.assertFalse(window._pending_installer)
+
+    def test_the_downloaded_installer_is_started_and_the_window_hands_over(self) -> None:
+        window = MainWindow(FakeEngine())
+        self.addCleanup(window.close)
+        downloaded = DownloadedUpdate(path=Path("ClipDock-Setup.exe"), version="v0.4.0")
+        window._pending_installer = True
+        with (
+            patch(
+                "youtube_downloader.gui.main_window.launch_installer", return_value=True
+            ) as launch,
+            patch.object(window, "close") as close,
+        ):
+            window._on_job_succeeded(downloaded)
+        launch.assert_called_once_with(downloaded.path)
+        close.assert_called_once()
+        self.assertFalse(window._pending_installer)
+        self.assertIn("installer", window.status_bar.currentMessage().lower())
+
+    def test_a_failed_installer_download_does_not_swallow_later_history(self) -> None:
+        # `_record_history` skips while `_pending_installer` is set.  A failure
+        # that left it set would make every later download unrecorded, which is
+        # a silent hole in the only record of what was saved.
+        window = self._open_window(FakeEngine())
+        window._pending_installer = True
+        with patch("youtube_downloader.gui.main_window.QMessageBox"):
+            window._on_job_failed(DownloadFailure("The update could not be downloaded."))
+        self.assertFalse(window._pending_installer)
+
+        with tempfile.TemporaryDirectory() as directory:
+            self._one_finished_download(window, directory)
+        self.assertEqual(len(history.read_history(self.history_path)), 1)
+
     # -- the automatic update check -----------------------------------------
 
     @staticmethod
@@ -2712,7 +2768,7 @@ class GuiSmokeTests(unittest.TestCase):
             self.assertIn("Saved", child.text(2))
             self.assertEqual(child.text(3), str(Path(directory) / "downloaded.mp4"))
 
-            self.assertEqual(view.summary_label.text(), "1 job recorded · newest first")
+            self.assertEqual(view.summary_label.text(), "1 job · 1 completed · newest first")
             self.assertTrue(view.tree.isVisible())
             self.assertFalse(view.empty_label.isVisible())
 
@@ -2825,6 +2881,276 @@ class GuiSmokeTests(unittest.TestCase):
         window.close()
         self.app.processEvents()
         self.assertFalse(view.isVisible())
+
+    def _record_history_job(
+        self,
+        outcome: str,
+        folder: str | Path,
+        *,
+        url: str = "https://youtu.be/id",
+        mode: str = "video",
+    ) -> None:
+        """Write one job straight into the file, so its state is exact."""
+
+        history.record_job(
+            {
+                "started": "2026-10-07T09:00:00",
+                "finished": "2026-10-07T09:10:00",
+                "mode": mode,
+                "requested": url,
+                "folder": str(folder),
+                "outcome": outcome,
+                "reason": "",
+                "succeeded": 0,
+                "failed": 0,
+                "total": 1,
+                "items": [],
+                "request": {"url": url, "output_dir": str(folder), "mode": mode},
+            },
+            self.history_path,
+        )
+
+    def test_an_interrupted_job_is_chipped_and_counted_as_interrupted(self) -> None:
+        # A window close is not a cancellation somebody chose, and the redesigned
+        # window is expected to say which of the six states it was before any
+        # sentence is read.
+        with tempfile.TemporaryDirectory() as directory:
+            self._record_history_job(history.OUTCOME_INTERRUPTED, directory)
+            window = self._open_window(FakeEngine())
+            window._show_history()
+            view = window._history_window
+
+            top = view.tree.topLevelItem(0)
+            self.assertEqual(top.text(2), "Interrupted")
+            self.assertEqual(view.summary_label.text(), "1 job · 1 interrupted · newest first")
+
+    def test_resume_is_offered_only_when_the_job_left_real_pieces(self) -> None:
+        # The staging folder is the evidence, not the outcome word: a Resume
+        # that starts from nothing would be a Retry wearing the wrong label.
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            self._record_history_job(history.OUTCOME_INTERRUPTED, folder)
+            window = self._open_window(FakeEngine())
+            window._show_history()
+            view = window._history_window
+
+            view.tree.setCurrentItem(view.tree.topLevelItem(0))
+            self.assertFalse(view.resume_button.isVisible())
+            self.assertTrue(view.retry_button.isVisible())
+
+            staging = folder / ".clipdock-parts"
+            staging.mkdir()
+            (staging / "half-done.mp4.ytdl").write_bytes(b"{}")
+            view.refresh()
+            view.tree.setCurrentItem(view.tree.topLevelItem(0))
+            self.assertFalse(
+                view.resume_button.isVisible(),
+                "a .ytdl is bookkeeping, not bytes to continue",
+            )
+
+            (staging / "half-done.mp4.part").write_bytes(b"x" * 32)
+            view.refresh()
+            view.tree.setCurrentItem(view.tree.topLevelItem(0))
+            self.assertTrue(view.resume_button.isVisible())
+            self.assertTrue(view.resume_button.isEnabled())
+            self.assertFalse(view.retry_button.isVisible())
+
+    def test_resume_and_retry_emit_the_recorded_job_only_from_their_own_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            self._record_history_job(history.OUTCOME_FAILED, folder)
+            window = self._open_window(FakeEngine())
+            window._show_history()
+            view = window._history_window
+            # This is about what the window emits, not what the main window
+            # does with it: the window's own connections would start a job and
+            # a second press would correctly refuse with a modal.
+            view.resume_requested.disconnect(window._resume_from_history)
+            view.retry_requested.disconnect(window._retry_from_history)
+            resumed: list[dict[str, object]] = []
+            retried: list[dict[str, object]] = []
+            view.resume_requested.connect(resumed.append)
+            view.retry_requested.connect(retried.append)
+
+            view.tree.setCurrentItem(view.tree.topLevelItem(0))
+            view._resume_selected()
+            self.assertEqual(resumed, [], "a failed job with no pieces has nothing to resume")
+            view._retry_selected()
+            self.assertEqual(len(retried), 1)
+            self.assertEqual(retried[0]["folder"], str(folder))
+            self.assertEqual(retried[0]["request"]["url"], "https://youtu.be/id")
+
+            staging = folder / ".clipdock-parts"
+            staging.mkdir()
+            (staging / "half-done.mp4.part").write_bytes(b"x" * 8)
+            history.record_job(
+                {
+                    "started": "2026-10-07T09:11:00",
+                    "finished": "2026-10-07T09:12:00",
+                    "mode": "video",
+                    "requested": "https://youtu.be/id",
+                    "folder": str(folder),
+                    "outcome": history.OUTCOME_PAUSED,
+                    "reason": "",
+                    "succeeded": 0,
+                    "failed": 0,
+                    "total": 1,
+                    "items": [],
+                    "request": {
+                        "url": "https://youtu.be/id",
+                        "output_dir": str(folder),
+                        "mode": "video",
+                    },
+                },
+                self.history_path,
+            )
+            view.refresh()
+            view.tree.setCurrentItem(view.tree.topLevelItem(0))
+            view._retry_selected()
+            self.assertEqual(len(retried), 1, "a paused job with pieces is not a Retry")
+            view._resume_selected()
+            self.assertEqual(len(resumed), 1)
+            self.assertEqual(resumed[0]["outcome"], history.OUTCOME_PAUSED)
+
+    def test_the_context_menu_offers_the_same_actions_as_the_buttons(self) -> None:
+        class FakeAction:
+            def __init__(self, text: str) -> None:
+                self._text = text
+                self.visible = True
+                self.enabled = True
+
+            def text(self) -> str:
+                return self._text
+
+            def setVisible(self, visible: bool) -> None:  # noqa: N802 - Qt spelling
+                self.visible = visible
+
+            def setEnabled(self, enabled: bool) -> None:  # noqa: N802 - Qt spelling
+                self.enabled = enabled
+
+            def isVisible(self) -> bool:  # noqa: N802 - Qt spelling
+                return self.visible
+
+            def isEnabled(self) -> bool:  # noqa: N802 - Qt spelling
+                return self.enabled
+
+        class FakeMenu:
+            def __init__(self, _parent: object = None) -> None:
+                self.actions: list[FakeAction] = []
+
+            def addAction(self, text: str) -> FakeAction:  # noqa: N802 - Qt spelling
+                action = FakeAction(text)
+                self.actions.append(action)
+                return action
+
+            def addSeparator(self) -> None:  # noqa: N802 - Qt spelling
+                return None
+
+            def exec(self, _position: object) -> FakeAction | None:  # noqa: N802
+                chosen = next(
+                    (action for action in self.actions if action.text() == "Resume"),
+                    None,
+                )
+                return chosen if chosen is not None and chosen.visible else None
+
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            self._record_history_job(history.OUTCOME_INTERRUPTED, folder)
+            staging = folder / ".clipdock-parts"
+            staging.mkdir()
+            (staging / "half-done.mp4.part").write_bytes(b"x" * 4)
+            window = self._open_window(FakeEngine())
+            window._show_history()
+            view = window._history_window
+            view.resume_requested.disconnect(window._resume_from_history)
+            view.retry_requested.disconnect(window._retry_from_history)
+            resumed: list[dict[str, object]] = []
+            view.resume_requested.connect(resumed.append)
+            view.tree.setCurrentItem(view.tree.topLevelItem(0))
+            centre = view.tree.visualItemRect(view.tree.topLevelItem(0)).center()
+
+            with patch.object(history_window, "QMenu", FakeMenu):
+                view._context_menu(centre)
+
+            self.assertEqual(len(resumed), 1)
+
+    def test_a_history_resume_reruns_the_recorded_job_with_its_own_settings(self) -> None:
+        # The two-phase path: a history row cannot be rebuilt without today's
+        # qualities, so Resume re-reads the video and then starts the download
+        # from the recorded folder and choices - not from whatever is on screen.
+        window = self._open_window(FakeEngine())
+        with tempfile.TemporaryDirectory() as directory:
+            self._one_finished_download(window, directory)
+            job = history.read_history(self.history_path)[0]
+            self.assertEqual(job["request"]["mode"], "video")
+
+            window._resume_from_history(job)
+            for _ in range(100):
+                QTest.qWait(50)
+                self.app.processEvents()
+                if (
+                    len(history.read_history(self.history_path)) == 2
+                    and not window.controller.is_running
+                ):
+                    break
+
+            jobs = history.read_history(self.history_path)
+            self.assertEqual(len(jobs), 2, window.status_label.text())
+            self.assertEqual(jobs[-1]["outcome"], history.OUTCOME_COMPLETE)
+            self.assertEqual(jobs[-1]["request"]["output_dir"], directory)
+            self.assertEqual(jobs[-1]["request"]["mode"], "video")
+            self.assertTrue((Path(directory) / "downloaded.mp4").is_file())
+
+    def test_a_batch_entry_restarts_from_its_links_without_a_probe(self) -> None:
+        # A batch is the one form that needs no re-read: its links and its one
+        # quality are recorded, so the continuation can begin immediately.  A
+        # probe would also have to answer for links the batch itself reads.
+        with tempfile.TemporaryDirectory() as directory:
+            history.record_job(
+                {
+                    "started": "2026-10-07T09:00:00",
+                    "finished": "2026-10-07T09:10:00",
+                    "mode": "queue",
+                    "requested": "2 links",
+                    "folder": directory,
+                    "outcome": history.OUTCOME_FAILED,
+                    "reason": "one link failed",
+                    "succeeded": 1,
+                    "failed": 1,
+                    "total": 2,
+                    "items": [],
+                    "request": {
+                        "urls": ["https://youtu.be/one", "https://youtu.be/two"],
+                        "output_dir": directory,
+                        "media": "video",
+                        "quality": {"height": 720, "fps": 30},
+                        "audio_bitrate": None,
+                        "preference": "quality",
+                        "subtitle_format": "srt",
+                        "subtitle_source": "preferred",
+                        "embed_cover": True,
+                    },
+                },
+                self.history_path,
+            )
+            window = self._open_window(FakeEngine())
+            job = history.read_history(self.history_path)[0]
+            window._retry_from_history(job)
+            for _ in range(100):
+                QTest.qWait(50)
+                self.app.processEvents()
+                if (
+                    len(history.read_history(self.history_path)) == 2
+                    and not window.controller.is_running
+                ):
+                    break
+
+            jobs = history.read_history(self.history_path)
+            self.assertEqual(len(jobs), 2, window.status_label.text())
+            self.assertEqual(jobs[-1]["mode"], "queue")
+            self.assertEqual(jobs[-1]["succeeded"], 2)
+            self.assertTrue((Path(directory) / "queued-1.mp4").is_file())
+            self.assertTrue((Path(directory) / "queued-2.mp4").is_file())
 
     @staticmethod
     def _wait_for_job(window: MainWindow) -> None:
