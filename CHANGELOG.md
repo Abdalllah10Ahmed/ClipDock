@@ -13,6 +13,87 @@ Release artefacts are attached to GitHub Releases rather than committed. The
 installer for a release is `ClipDock-Setup.exe`; verify it against the SHA-256
 printed at the end of `scripts/build_installer.ps1`.
 
+## [0.4.0] - 2026-10-23
+
+One release for the eight things 0.3.0 left undone or got wrong: a download that
+stops when YouTube asks for JavaScript, a first Fetch that fails and a second that
+works, a progress bar that stalls near 95%, unfinished files left in the folder
+you asked for, a Resume offer that ended when the program did, a History window
+that could not say whether a job was interrupted or cancelled, an update notice
+that could only open a browser, and an FFmpeg install that blamed your connection
+for its own failure. No runtime dependency was added; FFmpeg remains the only
+downloadable component.
+
+### Added
+
+- **CI that runs the real suite on a clean Windows machine.** Every push to
+  `main` and every pull request runs `windows-latest` with Python 3.14, installs
+  the two pinned packages, fetches the pinned FFmpeg into `vendor/` with its
+  checksum verified (cached by the pins themselves), then runs all 436 tests
+  headless. The badge is in the README.
+- **An update that installs from inside ClipDock.** When a newer release
+  publishes an installer, the offer is a **Download** / **Later** dialog. Download
+  fetches the asset over HTTPS from the project's own release path, refuses a
+  redirect to any other host, caps the file at 256 MB, requires the advertised
+  length, checks the SHA-256 when GitHub publishes one, starts it with
+  `/SILENT /NORESTART`, and closes ClipDock so the install can replace it. It is
+  refused while a download is running. A release with no installer still opens
+  its page; nothing is fetched on the automatic check alone.
+- **Resume after the program has been closed.** A job stopped by a close is
+  recorded as **Interrupted** rather than cancelled, and the History row offers
+  **Resume** from the link and choices it stored. Single videos and playlists are
+  re-read first because a stored format number can go stale; a batch restarts
+  directly from its links and one quality. The pieces themselves are the ones
+  yt-dlp already wrote, so the continuation does not start over.
+- **JavaScript runtimes for YouTube's challenge.** The engine looks for system
+  Deno, Node, Bun, or QuickJS and hands the ones it finds to yt-dlp, with Deno as
+  the declared fallback. This is the difference between "Sign in to confirm
+  you're not a bot" on the first Fetch and a working one. It adds no packaged
+  runtime.
+
+### Changed
+
+- **The destination folder now holds only finished files.** All unfinished
+  pieces go to a hidden `.clipdock-parts` folder inside it (`paths.home` plus
+  `paths.temp`, with a relative output template) and that folder is marked hidden
+  on Windows. The history and the Resume offer scan it, and they still recognise
+  a legacy `.part` left beside the target by an older version.
+- **Progress is continuous and 100% means the file exists.** Byte transfer owns
+  0–95%, merging or transcoding 96–97%, and 100 is emitted only after the final
+  file has been verified. Video and audio byte totals are combined rather than
+  each taking a turn at 100, which is what pinned the old bar at the end.
+- **The History window was rebuilt around state.** Six chips — Completed, Partly
+  saved, Paused, Interrupted, Failed, Cancelled — come before any sentence, a
+  header counts them, and the selected row offers Open folder, Resume, or Retry
+  as each applies. The same actions are on the context menu. Folding older jobs
+  is unchanged.
+- **Update text is now truthful.** The automatic check still downloads nothing;
+  the notice and the manual dialog no longer claim ClipDock "does not update
+  itself" or that no download path exists, because both are false as of this
+  release.
+
+### Fixed
+
+- **Fetch failing on the first click and succeeding on the retry.** Transient
+  failures (`network_failure`, `rate_limited`, `download_failed`) are retried
+  inside the fetch itself; a wrong or unsupported link is not, so a real error is
+  still reported on the first attempt.
+- **A mid-download cancellation or unexpected exception surfacing as a generic
+  failure.** Cancellation is recognised even when yt-dlp or the filesystem raises
+  first, and the remaining errors keep their classified message instead of being
+  flattened into "something went wrong".
+- **FFmpeg install blaming the connection when the connection was fine.**
+  Transient causes (429, 5xx, timeout, unreachable, a dropped transfer) are
+  retried; 401/403/404 and TLS failures are reported as what they are. The
+  "check your internet connection" sentence is now used only for a cause that
+  points at the connection.
+- **A failed installer download poisoning later history.** The pending-installer
+  flag is cleared on failure and cancellation; without that, every later job was
+  skipped by the history recorder.
+- **Retry was offered beside Resume on a row that should only Resume.** The
+  action helpers now apply the same rule as the visible buttons, so a paused job
+  with real pieces cannot be restarted from the context menu by mistake.
+
 ## [0.3.0] - 2026-10-08
 
 Five fixes and four additions. The additions are the four things asked for after
@@ -181,7 +262,8 @@ First public release. Everything below is new.
 - No runtime dependency beyond PySide6 and yt-dlp; both are bundled. FFmpeg is
   the only thing ever downloaded, and only after asking.
 
-[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Abdalllah10Ahmed/ClipDock/releases/tag/v0.1.0

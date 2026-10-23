@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import tempfile
 import time
 import urllib.error
@@ -57,18 +58,46 @@ from .urls import UrlValidationError, normalize_youtube_playlist_url, normalize_
 
 SUPPORTED_PLAYLIST_AUDIO_BITRATES = (128, 192, 256, 320)
 
-# An interrupted download leaves its unfinished pieces *beside the target*, not in
-# a `paths.temp` folder.  `paths` is inert for every download the engine runs:
-# yt-dlp warns "--paths is ignored since an absolute path is given in output
-# template" and raises that whenever `os.path.isabs(filename)`, and the engine
-# builds `outtmpl` from an absolute `output_dir` even though the template itself is
-# relative.  An interrupted Sprite Fright download left no `.parts` directory at
-# all -- it left `...f620.mp4.part`, `...f620.mp4.part-Frag3.part` and a 69-byte
-# `...f620.mp4.ytdl` next to where the finished file would go.  So this is where an
-# unfinished download actually is, and it is the only place worth looking.
+# Everything unfinished lives in one folder inside the destination.  yt-dlp
+# downloads fragments and intermediate streams into `paths.temp` and moves only
+# the finished file into `paths.home`; `--paths` is honoured only while the
+# output template is *relative*, which is why the template is passed without a
+# directory and home/temp are named separately.  The result is that a stopped or
+# crashed download leaves its `.part` and `.part-FragN.part` pieces here rather
+# than beside the video, and the destination folder shows only finished files.
+#
+# The folder is marked hidden on Windows (a leading dot is not hidden there), so
+# Explorer's default view is the requested one: only the finished video.
+STAGING_DIRNAME = ".clipdock-parts"
+
 _FRAGMENT_PART = re.compile(r"^(?P<target>.+)\.part-Frag\d+\.part$", re.IGNORECASE)
 _STATE_FILE_SUFFIX = ".ytdl"
 _PART_SUFFIX = ".part"
+
+
+def staging_directory(output_dir: Path) -> Path:
+    """Where an unfinished download keeps its pieces inside ``output_dir``."""
+
+    return Path(output_dir) / STAGING_DIRNAME
+
+
+def hide_directory(directory: Path) -> None:
+    """Mark the staging folder hidden, so Explorer shows only finished files.
+
+    Best effort by design: a filesystem that refuses the attribute still has a
+    perfectly usable staging folder, and failing a download over a display
+    preference would be the wrong trade.
+    """
+
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        file_attribute_hidden = 0x2
+        ctypes.windll.kernel32.SetFileAttributesW(str(directory), file_attribute_hidden)
+    except Exception:
+        return
 
 
 @dataclass(frozen=True)
@@ -103,7 +132,12 @@ class UnfinishedDownload:
 
 
 def unfinished_downloads(output_dir: Path) -> tuple[UnfinishedDownload, ...]:
-    """Interrupted downloads found in ``output_dir``, oldest name first.
+    """Interrupted downloads in ``output_dir``, oldest name first.
+
+    Both places are read: the hidden staging folder this version downloads into,
+    and the folder itself for pieces left by an older version.  An upgrade must
+    not strand a download somebody was halfway through, so the old location stays
+    supported even though new work never writes there.
 
     Nothing here opens, reads or deletes a piece: an interrupted run's ``.part``
     file can still be locked while the application lives (a cancelled download
@@ -111,23 +145,32 @@ def unfinished_downloads(output_dir: Path) -> tuple[UnfinishedDownload, ...]:
     only listed and every size is read defensively.
     """
 
+    staging = staging_directory(output_dir)
+    places = [output_dir]
     try:
-        entries = sorted(output_dir.iterdir(), key=lambda path: path.name.lower())
+        if staging.is_dir():
+            places.append(staging)
     except OSError:
-        return ()
+        pass
+
     grouped: dict[str, list[Path]] = {}
-    for path in entries:
-        name = path.name
-        fragment = _FRAGMENT_PART.match(name)
-        if fragment is not None:
-            target = fragment.group("target")
-        elif name.lower().endswith(_PART_SUFFIX):
-            target = name[: -len(_PART_SUFFIX)]
-        elif name.lower().endswith(_STATE_FILE_SUFFIX):
-            target = name[: -len(_STATE_FILE_SUFFIX)]
-        else:
+    for place in places:
+        try:
+            entries = sorted(place.iterdir(), key=lambda path: path.name.lower())
+        except OSError:
             continue
-        grouped.setdefault(target, []).append(path)
+        for path in entries:
+            name = path.name
+            fragment = _FRAGMENT_PART.match(name)
+            if fragment is not None:
+                target = fragment.group("target")
+            elif name.lower().endswith(_PART_SUFFIX):
+                target = name[: -len(_PART_SUFFIX)]
+            elif name.lower().endswith(_STATE_FILE_SUFFIX):
+                target = name[: -len(_STATE_FILE_SUFFIX)]
+            else:
+                continue
+            grouped.setdefault(target, []).append(path)
     found: list[UnfinishedDownload] = []
     for target, parts in grouped.items():
         total: int | None = 0
@@ -229,6 +272,70 @@ def item_slice_progress(
     offset = 0.0 if probing else _ITEM_PROBE_SHARE
     span = _ITEM_PROBE_SHARE if probing else 1.0 - _ITEM_PROBE_SHARE
     return (item_index + offset + span * item_percent / 100.0) / total * 100.0
+
+
+# yt-dlp 2026 enables **Deno only** unless it is told otherwise
+# (``YoutubeDL.py``: ``js_runtimes`` defaults to ``{"deno": {}}``).  A machine
+# with Node.js installed therefore has a working JavaScript runtime that the
+# challenge solver never looks at.  Naming the runtimes that are already here
+# adds no dependency: it is the same principle as using a system FFmpeg, and it
+# is the difference between "this video needs JavaScript" and a download.
+#
+# The keys are yt-dlp's runtime names; the values are the executables to look
+# for.  QuickJS registers as "quickjs" but ships its binary as ``qjs``.
+JS_RUNTIME_EXECUTABLES: tuple[tuple[str, str], ...] = (
+    ("deno", "deno"),
+    ("node", "node"),
+    ("bun", "bun"),
+    ("quickjs", "qjs"),
+)
+
+# Fetching details is one request, and a second one is cheap; the complaint this
+# answers was exact - the first tap failed and the second worked.  The wait is
+# `_retry_backoff`, so a retry asks politely rather than immediately.  Not every
+# failure is worth repeating: a private video is reported on the first attempt.
+FETCH_RETRY_ATTEMPTS = 3
+_RETRYABLE_FETCH_CODES = frozenset({"network_failure", "rate_limited", "download_failed"})
+
+# The share of the bar a byte transfer may occupy.  The band above it belongs
+# to the merge or conversion, and 100 is only reported once the finished file
+# exists -- the bar never claims completion while something can still fail.
+_DOWNLOAD_PROGRESS_LIMIT = 95.0
+
+# yt-dlp names a postprocessor in its hook; a person reads the phase instead.
+# Unknown names still get a truthful generic label rather than a class name.
+_POSTPROCESSOR_PHASES = {
+    "Merger": "Merging audio and video",
+    "VideoConvertor": "Converting video to MP4",
+    "ExtractAudio": "Converting audio to MP3",
+    "EmbedThumbnail": "Embedding cover art",
+    "MoveFiles": "Finalizing file",
+    "FixupM4a": "Fixing the audio container",
+    "FixupM3u8": "Fixing the video container",
+    "FixupTimestamp": "Fixing media timestamps",
+    "FixupDuration": "Fixing media duration",
+}
+
+
+def _postprocessor_label(name: str) -> str:
+    return _POSTPROCESSOR_PHASES.get(name, "Processing media")
+
+
+def detect_js_runtimes() -> dict[str, dict[str, str]]:
+    """The JavaScript runtimes yt-dlp may use, named as it expects them.
+
+    Returns what is actually installed, falling back to yt-dlp's own Deno-only
+    default when this machine has none.  The fallback is deliberate: passing an
+    empty mapping would disable the default, and a later Deno install would then
+    go unnoticed until the next release.
+    """
+
+    found = {
+        name: {}
+        for name, executable in JS_RUNTIME_EXECUTABLES
+        if shutil.which(executable)
+    }
+    return found or {"deno": {}}
 
 
 def _retry_backoff(attempt: int) -> float:
@@ -484,8 +591,15 @@ class Engine:
             "trim_file_name": 180,
             "overwrites": False,
             "cachedir": False,
-            "paths": {"home": str(output_dir), "temp": str(output_dir / ".parts")},
-            "outtmpl": {"default": str(output_dir / CLEAN_OUTTMPL)},
+            # Without this, yt-dlp ignores every runtime except Deno; see
+            # `detect_js_runtimes`.  The solver itself is bundled with yt-dlp,
+            # so this is the only missing half of JavaScript challenge support.
+            "js_runtimes": detect_js_runtimes(),
+            "paths": {"home": str(output_dir), "temp": str(staging_directory(output_dir))},
+            # Relative on purpose.  yt-dlp ignores `paths` entirely when the
+            # template is absolute, which is why pieces used to be written
+            # beside the finished file; see the staging comment at the top.
+            "outtmpl": {"default": CLEAN_OUTTMPL},
             "progress_hooks": [self._yt_dlp_progress_hook(progress)],
             "postprocessor_hooks": [self._postprocessor_hook(progress)],
         }
@@ -523,7 +637,28 @@ class Engine:
         return f"{minutes:d}:{seconds:02d} remaining"
 
     def _yt_dlp_progress_hook(self, progress: _ProgressRelay) -> Callable[[dict[str, Any]], None]:
+        # Raw transfer progress stops here.  The rest of the bar belongs to the
+        # merge or conversion, which has no byte count of its own; leaving room
+        # for it is what stops the bar from claiming completion while the file
+        # is still being written.
+        #
+        # Keyed by the file yt-dlp is writing.  A merged download is two files
+        # (video, then audio), each reporting its own 0-100%, and summing them
+        # is the only way one bar can describe both.  That also fixes the old
+        # stall: the video stream used to reach 100% and pin the bar there for
+        # the entire audio download.
+        streams: dict[str, tuple[float, float]] = {}
+        last_percent = 0.0
+
+        def combined() -> float | None:
+            total = sum(size for _, size in streams.values())
+            if not total:
+                return None
+            done = sum(min(downloaded, size) for downloaded, size in streams.values())
+            return min(_DOWNLOAD_PROGRESS_LIMIT, done / total * _DOWNLOAD_PROGRESS_LIMIT)
+
         def hook(data: dict[str, Any]) -> None:
+            nonlocal last_percent
             progress.check_cancelled()
             status = data.get("status")
             if status == "downloading":
@@ -532,23 +667,32 @@ class Engine:
                 if estimated:
                     total = data.get("total_bytes_estimate")
                 downloaded = data.get("downloaded_bytes") or 0
-                percent = None
+                key = str(data.get("filename") or data.get("format_id") or "media")
                 try:
-                    if total:
-                        percent = float(downloaded) / float(total) * 100
-                except (TypeError, ValueError, ZeroDivisionError):
-                    percent = None
-                # Before a fragment download has completed its first fragment,
-                # yt-dlp's estimate is only the size of the fragment it is
-                # reading, so it reports a finished file (downloaded equals the
-                # estimate) before anything meaningful has landed.  An estimate
-                # that claims the whole file while the download is still
-                # running is not a number worth showing: the bar treats it as a
-                # floor and pins itself there.  Measured at
-                # ``downloaded_bytes 712, total_bytes_estimate 712`` on the
-                # first hook of a real run.
-                if estimated and percent is not None and percent >= 100.0:
-                    percent = None
+                    size = float(total) if total else 0.0
+                    done = float(downloaded)
+                except (TypeError, ValueError):
+                    size, done = 0.0, 0.0
+                if size > 0:
+                    # Before a fragment download has completed its first
+                    # fragment, yt-dlp's estimate is only the size of the
+                    # fragment it is reading, so it reports a finished file
+                    # (712 of 712, measured) before anything meaningful has
+                    # landed.  An estimate that claims the whole file on its
+                    # first report is not a number worth showing.  A later
+                    # report for a stream already being tracked is trusted,
+                    # including the legitimate 100% at its very end.
+                    degenerate = estimated and done >= size and key not in streams
+                    if not degenerate:
+                        previous = streams.get(key)
+                        if previous is not None:
+                            done = max(done, previous[0])
+                            size = max(size, previous[1])
+                        streams[key] = (done, size)
+                percent = combined()
+                if percent is not None:
+                    percent = max(percent, last_percent)
+                    last_percent = percent
                 progress.emit(
                     "downloading",
                     percent,
@@ -557,24 +701,80 @@ class Engine:
                     eta=self._format_eta(data.get("eta")),
                 )
             elif status == "finished":
-                progress.emit("processing", None, "Processing media", force=True)
+                percent = combined()
+                if percent is not None and percent >= last_percent:
+                    last_percent = percent
+                progress.emit("processing", percent, "Media downloaded", force=True)
             elif status == "error":
                 progress.emit("processing", None, "Finishing media", force=True)
 
         return hook
 
     def _postprocessor_hook(self, progress: _ProgressRelay) -> Callable[[dict[str, Any]], None]:
+        started = 0
+
         def hook(data: dict[str, Any]) -> None:
+            nonlocal started
             progress.check_cancelled()
             status = data.get("status")
+            label = _postprocessor_label(str(data.get("postprocessor") or ""))
             if status == "started":
-                progress.emit("processing", None, "Processing media", force=True)
+                started += 1
+                # The first pass is the expensive one (merge or conversion).
+                # Any further pass is a rename or a cleanup, so it belongs at
+                # the very end of the bar rather than back at its start.
+                percent = 96.0 if started == 1 else 97.0
+                progress.emit("processing", percent, label, force=True)
             elif status == "processing":
-                progress.emit("processing", None, "Processing media")
+                progress.emit("processing", 97.0 if started > 1 else 96.0, label)
             elif status == "finished":
-                progress.emit("finalizing", 100.0, "Finalizing file", force=True)
+                progress.emit("finalizing", 97.0, label or "Finalizing file", force=True)
 
         return hook
+
+    def _fetch_with_retries(
+        self,
+        action: Callable[[], Any],
+        relay: _ProgressRelay,
+        *,
+        operation: str,
+    ) -> Any:
+        """Run a details request, repeating only failures a retry can fix.
+
+        The engine used to make exactly one attempt, so a transient 503 or a
+        dropped connection reached the person as "fetch failed", and the retry
+        that worked was the one they performed by hand.  Each attempt builds a
+        fresh ``YoutubeDL``; a failed instance is not reused.
+
+        Only network faults, rate limits and yt-dlp's unclassified download
+        failures are repeated.  Everything that is a decision about the video --
+        private, removed, age-restricted, a bad link -- is reported at once,
+        because waiting a second attempt only delays the explanation.
+        """
+
+        for attempt in range(FETCH_RETRY_ATTEMPTS):
+            try:
+                return action()
+            except Exception as error:
+                mapped = friendly_error(error)
+                if mapped.code not in _RETRYABLE_FETCH_CODES or attempt + 1 >= FETCH_RETRY_ATTEMPTS:
+                    raise
+                wait = _retry_backoff(attempt)
+                self._logger.info(
+                    "fetch_retry operation=%s attempt=%d of=%d reason=%s",
+                    operation,
+                    attempt + 2,
+                    FETCH_RETRY_ATTEMPTS,
+                    classify_yt_dlp_message(str(error)),
+                )
+                relay.emit(
+                    "waiting",
+                    None,
+                    "YouTube did not answer - trying again",
+                    force=True,
+                )
+                self._wait_before_retry(wait, relay)
+        raise AssertionError("unreachable")
 
     def probe(
         self,
@@ -589,9 +789,13 @@ class Engine:
             normalized_url = normalize_youtube_url(raw_url)
             options = self._base_options(Path.cwd(), relay)
             options.update({"skip_download": True, "extract_flat": False})
-            ydl = self._new_ydl(options)
-            with ydl:
-                raw_info = ydl.extract_info(normalized_url, download=False)
+
+            def extract() -> Any:
+                ydl = self._new_ydl(options)
+                with ydl:
+                    return ydl.extract_info(normalized_url, download=False)
+
+            raw_info = self._fetch_with_retries(extract, relay, operation="probe")
             relay.check_cancelled()
             info = self._build_video_info(raw_info, normalized_url)
             relay.emit("probing", 100.0, "Video details ready", force=True)
@@ -620,11 +824,15 @@ class Engine:
             normalized_url = normalize_youtube_playlist_url(raw_url)
             options = self._base_options(Path.cwd(), relay)
             options.update({"skip_download": True, "extract_flat": False, "noplaylist": False})
-            ydl = self._new_ydl(options)
-            with ydl:
-                raw_info = ydl.extract_info(normalized_url, download=False)
-                relay.check_cancelled()
-                info = self._build_playlist_info(raw_info, normalized_url, ydl, relay)
+
+            def extract() -> PlaylistInfo:
+                ydl = self._new_ydl(options)
+                with ydl:
+                    raw_info = ydl.extract_info(normalized_url, download=False)
+                    relay.check_cancelled()
+                    return self._build_playlist_info(raw_info, normalized_url, ydl, relay)
+
+            info = self._fetch_with_retries(extract, relay, operation="playlist_probe")
             relay.emit("probing", 100.0, "Playlist details ready", force=True)
             self._logger.info(
                 "playlist_probe_completed videos=%d skipped=%d qualities=%d",
@@ -1684,13 +1892,24 @@ class Engine:
         except UrlValidationError as error:
             raise ExtractionError(str(error), code="invalid_url") from error
         output_dir = self._prepare_output_dir(request.output_dir)
-        options["outtmpl"] = {"default": str(output_dir / CLEAN_OUTTMPL)}
-        options["paths"] = {"home": str(output_dir), "temp": str(output_dir / ".parts")}
+        staging = staging_directory(output_dir)
+        try:
+            staging.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise StorageError(
+                "The temporary download folder could not be created inside the destination."
+            ) from error
+        hide_directory(staging)
+        # Relative template plus named directories: yt-dlp only honours `paths`
+        # while the template is relative, and `paths.temp` is what keeps partial
+        # files out of the folder the person is looking at.
+        options["outtmpl"] = {"default": CLEAN_OUTTMPL}
+        options["paths"] = {"home": str(output_dir), "temp": str(staging)}
         ydl = self._new_ydl(options)
         if self._clean_name_is_taken(ydl, request, expected_extension):
             # yt-dlp reads the template out of params each time it names a file,
             # so switching it here is enough and saves building a second YoutubeDL.
-            ydl.params.setdefault("outtmpl", {})["default"] = str(output_dir / ID_OUTTMPL)
+            ydl.params.setdefault("outtmpl", {})["default"] = ID_OUTTMPL
             self._logger.info(
                 "filename_disambiguated video_id=%s because_the_title_is_already_taken",
                 request.info.video_id,
@@ -1708,7 +1927,6 @@ class Engine:
             if not isinstance(result, dict) or result.get("_type") in {"playlist", "multi_video"}:
                 raise UnsupportedContentError("The link resolved to a playlist or channel instead of one video.")
             path = self._output_path_from_result(result, expected_extension)
-            relay.emit("completed", 100.0, "Download complete", force=True)
             written: tuple[Path, ...] = ()
             if request.mode is DownloadMode.SUBTITLES:
                 # A caption run reports one file per language.  ``subtitle_paths``
@@ -1717,13 +1935,18 @@ class Engine:
                 written = tuple(self._output_paths_from_result(result, expected_extension))
                 if not written:
                     written = (path,)
-                if len(written) > 1:
-                    relay.emit(
-                        "completed",
-                        100.0,
-                        f"Saved {len(written)} subtitle files",
-                        force=True,
-                    )
+            # Emitted only now: the requested file exists, and nothing that
+            # could still fail is left.  Reporting 100% before the last step is
+            # what made the bar look finished while work was still going on.
+            if len(written) > 1:
+                relay.emit(
+                    "completed",
+                    100.0,
+                    f"Saved {len(written)} subtitle files",
+                    force=True,
+                )
+            else:
+                relay.emit("completed", 100.0, "Download complete", force=True)
             return DownloadResult(path=path, mode=request.mode, subtitle_paths=written)
         except CancelledError:
             raise
@@ -1732,6 +1955,16 @@ class Engine:
                 raise CancelledError() from error
             safe_log_error(self._logger, error, operation=request.mode.value)
             raise friendly_error(error) from error
+        finally:
+            # Only an empty folder is removed.  A cancelled run keeps its pieces
+            # on purpose: those are what Resume continues from, across restarts
+            # as well, because the folder lives beside the videos rather than in
+            # a process's temporary directory.
+            try:
+                if staging.is_dir() and not any(staging.iterdir()):
+                    staging.rmdir()
+            except OSError:
+                pass
 
     def download_video(
         self,

@@ -60,6 +60,7 @@ from ..core.errors import AppError
 from ..core.history import (
     OUTCOME_CANCELLED,
     OUTCOME_FAILED,
+    OUTCOME_INTERRUPTED,
     OUTCOME_PAUSED,
     build_job,
     record_job,
@@ -84,8 +85,15 @@ from ..core.models import (
     estimate_audio_size_bytes,
     format_size,
 )
-from ..core.settings import read_settings, write_setting
-from ..core.updates import RELEASES_URL, UpdateCheck, check_for_updates
+from ..core.settings import default_settings_directory, read_settings, write_setting
+from ..core.updates import (
+    RELEASES_URL,
+    UpdateCheck,
+    check_for_updates,
+    download_update,
+    launch_installer,
+)
+from ..core.updates import DownloadedUpdate
 from ..core.urls import UrlValidationError, normalize_youtube_playlist_url, normalize_youtube_url
 from . import caption
 from .caption import CaptionButton
@@ -282,6 +290,25 @@ class MainWindow(QMainWindow):
         # download it was not.
         self._history_window: HistoryWindow | None = None
         self._job_started: str = ""
+        # The job a History row asked to run again, and the details a re-probe
+        # returns.  A re-run is two worker jobs - a probe, then a download - so
+        # the download can be built from today's formats while still using the
+        # saved folder and settings.  Only the History buttons set these; a
+        # download never starts again on its own.
+        self._pending_resume: dict[str, Any] | None = None
+        self._pending_resume_info: Any = None
+        # True while the worker is fetching an installer, so its result is not
+        # filed as a download or shown as one.
+        self._pending_installer = False
+        # Set only on the way out, so a job stopped by closing the window is
+        # recorded as interrupted rather than as a cancellation somebody chose.
+        self._closing = False
+        # The corner notice about a newer release.  Built on demand rather than
+        # with the window, so a launch that finds nothing leaves no hidden frame
+        # behind; `resizeEvent` may run before anything has been built.
+        self._update_toast: QFrame | None = None
+        self._update_toast_result: UpdateCheck | None = None
+        self._update_toast_url: str = RELEASES_URL
         # The automatic update check, and the one piece of state it needs.
         #
         # Both the manual Help-menu check and this one produce an UpdateCheck
@@ -293,8 +320,6 @@ class MainWindow(QMainWindow):
         # check cannot leave the next manual one reporting as though it had
         # been asked for in the background.
         self._update_check_automatic = False
-        self._update_toast: QFrame | None = None
-        self._update_toast_url: str = RELEASES_URL
         self._update_check_timer = QTimer(self)
         self._update_check_timer.setSingleShot(True)
         self._update_check_timer.setInterval(UPDATE_CHECK_DELAY_MS)
@@ -491,15 +516,16 @@ class MainWindow(QMainWindow):
         self._remove_ffmpeg_action.setEnabled(installed_ffmpeg() is not None)
 
     def _check_for_updates(self) -> None:
-        """Ask GitHub whether a newer release exists.  Report it; never fetch it.
+        """Ask GitHub whether a newer release exists, and report it.
 
         It runs through the same controller a download uses, so the window keeps
         responding to the mouse while it waits.  A frozen interface for eight
         seconds would be a worse answer than no update check at all, and the
         point of offering this at all is that the person chose to ask.
 
-        Nothing is downloaded, and nothing is written.  The only thing this can
-        produce is a version number to show and a page to open in a browser.
+        The check itself downloads nothing and writes nothing.  If the release
+        publishes an installer this can verify, the report offers *Download*,
+        and only that second, explicit choice calls ``_install_update``.
         """
 
         if self.controller.is_running:
@@ -584,7 +610,7 @@ class MainWindow(QMainWindow):
     def _report_update(
         self, result: UpdateCheck, *, automatic: bool = False
     ) -> None:
-        """Say what the check found.  The only action offered is opening a page.
+        """Say what the check found and offer to install when possible.
 
         An automatic check reports in exactly one case: there is a release to
         report.  Up to date, unreachable, rate-limited, or a tag nobody can
@@ -593,6 +619,11 @@ class MainWindow(QMainWindow):
         say "you are up to date" would be worse than no check, and a dialog
         that opened by itself to say "I could not reach GitHub" would be the
         connectivity problem presented as an application problem.
+
+        When the release publishes ClipDock-Setup.exe the button is Download,
+        not Open the release page, and Download installs directly without
+        taking the person to GitHub.  If the installer is missing the dialog
+        falls back to opening the release page.
         """
 
         if automatic:
@@ -601,7 +632,9 @@ class MainWindow(QMainWindow):
             return
 
         if result.available:
-            self.status_bar.showMessage(f"ClipDock {result.latest} is available.", 10000)
+            self.status_bar.showMessage(
+                f"ClipDock {result.latest} is available.", 10000
+            )
             box = QMessageBox(self)
             box.setWindowTitle("A newer ClipDock is available")
             box.setIcon(QMessageBox.Icon.Information)
@@ -610,16 +643,29 @@ class MainWindow(QMainWindow):
                 f"You are running ClipDock <b>{result.current}</b>.<br><br>"
                 f"<b>{result.latest}</b> has been published."
             )
+            if result.can_install:
+                box.setInformativeText(
+                    "ClipDock will download the installer, verify it, and start it. "
+                    "The app closes once the installer is ready to run."
+                )
+                download_button = box.addButton(
+                    "Download", QMessageBox.ButtonRole.AcceptRole
+                )
+                box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+                box.setDefaultButton(download_button)
+                box.exec()
+                if box.clickedButton() is download_button:
+                    self._install_update(result)
+                return
             box.setInformativeText(
-                "ClipDock does not update itself, and it has not downloaded "
-                "anything. The release page lists what changed and what it "
-                "weighs; installing from there is your decision, not this "
-                "program's."
+                "ClipDock does not update itself. The release page lists what "
+                "changed and what it weighs; installing from there is your "
+                "decision, not this program's."
             )
             open_button = box.addButton(
                 "Open the release page", QMessageBox.ButtonRole.AcceptRole
             )
-            box.addButton("Not now", QMessageBox.ButtonRole.RejectRole)
+            box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
             box.setDefaultButton(open_button)
             box.exec()
             if box.clickedButton() is open_button:
@@ -631,8 +677,6 @@ class MainWindow(QMainWindow):
             box = QMessageBox(self)
             box.setWindowTitle("ClipDock is up to date")
             box.setIcon(QMessageBox.Icon.Information)
-            # Stated rather than left implicit: the check happened, and a reader
-            # who did not ask for it is entitled to know what it did.
             box.setTextFormat(Qt.TextFormat.RichText)
             box.setText(
                 f"ClipDock <b>{result.current}</b> is the latest published release.<br><br>"
@@ -653,27 +697,66 @@ class MainWindow(QMainWindow):
         )
         box.exec()
 
+    def _install_update(self, result: UpdateCheck) -> None:
+        """Download and launch the installer without leaving the dialog flow."""
+
+        if self.controller.is_running:
+            QMessageBox.information(
+                self,
+                "Already working",
+                "ClipDock is busy with another task. Download the update when it has finished.",
+            )
+            return
+        self._pending_installer = True
+        self._set_busy(True, "Downloading the ClipDock update")
+        self._reset_progress_display()
+        self.status_bar.showMessage("Downloading the ClipDock update")
+
+        def operation(progress: Any, cancel_check: Any) -> Any:
+            return download_update(
+                result,
+                default_settings_directory(),
+                progress=progress,
+                cancel_check=cancel_check,
+            )
+
+        self.controller.start(operation)
+
     def _show_update_toast(self, result: UpdateCheck) -> None:
-        """Offer the release in the corner, and offer nothing else.
+        """Offer the release in the corner, with one action and no urgency.
 
         The one automatic notice the program is allowed to produce, so the
         wording is doing the work of a conversation: it names the version, it
-        says what is running, and it stops.  There is no "Update now", no
-        exclamation mark, and nothing red - a newer release existing is a
-        fact about a web page, and dressing it as an event would be the
-        program implying urgency it has no grounds for.
+        says what is running, and it stops.  When the release publishes a
+        verifiable installer, the action is **Download update**; otherwise it
+        opens the release page.  Nothing is fetched until that button is
+        pressed.  There is no exclamation mark and nothing red - a newer release
+        existing is a fact about a web page, and dressing it as an event would
+        be the program implying urgency it has no grounds for.
         """
 
         toast = self._update_toast
         if toast is None:
             toast = self._build_update_toast()
             self._update_toast = toast
+        self._update_toast_result = result
+        self._update_toast_url = result.release_url
         latest = result.latest or "a newer release"
         self._update_toast_heading.setText(f"A newer ClipDock is available: {latest}")
         self._update_toast_detail.setText(
             f"You have {result.current}. {latest} has been published."
         )
-        self._update_toast_url = result.release_url
+        if result.can_install:
+            self._update_toast_note.setText(
+                "Download and install this update directly, or open the release page."
+            )
+            self._update_toast_open.setText("Download update")
+        else:
+            self._update_toast_note.setText(
+                "ClipDock has not downloaded anything and does not update itself. "
+                "What changed, and what it weighs, are on the release page."
+            )
+            self._update_toast_open.setText("Open the release page")
         toast.show()
         toast.raise_()
         self._position_update_toast()
@@ -684,10 +767,9 @@ class MainWindow(QMainWindow):
         On demand rather than during construction: a launch that found nothing
         would otherwise leave a hidden widget in every window ever opened.
 
-        It offers exactly one thing - a web page - and says so.  There is no
-        "Update" button because there is nothing behind one: ClipDock does not
-        install itself, and a second button opening the page the first one
-        describes would be pretending otherwise.
+        It offers one thing, and its label says which: Download when the release
+        publishes an installer ClipDock can verify and run, or Open the release
+        page when it does not.  The notice never starts a download by itself.
         """
 
         frame = QFrame(self)
@@ -726,22 +808,27 @@ class MainWindow(QMainWindow):
         )
         note.setObjectName("updateToastNote")
         note.setWordWrap(True)
+        self._update_toast_note = note
         layout.addWidget(note)
 
         open_button = QPushButton("Open the release page", frame)
         open_button.setObjectName("updateToastOpen")
         open_button.clicked.connect(self._open_update_toast_page)
+        self._update_toast_open = open_button
         layout.addWidget(open_button, 0, Qt.AlignmentFlag.AlignLeft)
         return frame
 
     def _open_update_toast_page(self) -> None:
-        """Open the release page, and only a page that really is one."""
+        """Open the release page, or install when Download is offered."""
 
-        url = QUrl(self._update_toast_url)
+        result = getattr(self, "_update_toast_result", None)
+        if isinstance(result, UpdateCheck) and result.can_install:
+            if self._update_toast is not None:
+                self._update_toast.hide()
+            self._install_update(result)
+            return
+        url = QUrl(getattr(self, "_update_toast_url", None) or RELEASES_URL)
         if url.scheme() != "https":
-            # `check_for_updates` already replaces an `html_url` that is not
-            # https with the releases page, so this is a second lock on the
-            # same door rather than a repair for something observed.
             url = QUrl(RELEASES_URL)
         QDesktopServices.openUrl(url)
 
@@ -833,28 +920,26 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Remove the FFmpeg ClipDock installed?",
-            f"This deletes:\n\n{target}\n\nand frees about {FFMPEG_INSTALLED_BYTES // 1_000_000} MB. "
+            f"This deletes:\n\n{target}\n\n"
+            f"and frees about {FFMPEG_INSTALLED_BYTES // 1_000_000} MB. "
             "Video merging, MP3 conversion, and cover art will stop working until FFmpeg is available again. "
             "FFmpeg installed by anything else is not touched.\n\nDelete it?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        if answer is not QMessageBox.StandardButton.Yes:
+        if answer != QMessageBox.StandardButton.Yes:
             return
-        if clear_cached_ffmpeg():
-            forget_discovery()
-            self.status_label.setText("Removed the FFmpeg ClipDock installed.")
-            QMessageBox.information(
-                self,
-                "Removed",
-                f"Deleted {target}. Use Check dependencies again to put it back.",
-            )
-        else:
+        removed = remove_installed_ffmpeg()
+        if not removed:
             QMessageBox.warning(
                 self,
-                "Could not remove it",
-                "ClipDock could not delete that file. Close anything that might be using it and try again.",
+                "Could not remove FFmpeg",
+                "The file could not be removed. It may be in use, or permissions prevented it.",
             )
+            return
+        clear_cached_ffmpeg()
+        forget_discovery()
+        self.status_label.setText("FFmpeg removed.")
 
     def _show_about(self) -> None:
         QMessageBox.about(
@@ -864,10 +949,11 @@ class MainWindow(QMainWindow):
             "Downloads publicly accessible YouTube videos as MP4 or MP3, and saves "
             "their captions.<br><br>"
             f"yt-dlp {ytdlp_version() or 'version unavailable'}<br>"
-            "FFmpeg is the only thing this program ever downloads, and only after asking."
-            "<br><br>ClipDock does not update itself. Help - Check for ClipDock "
-            f"updates asks GitHub whether a newer release exists and shows you "
-            f'the page; it downloads nothing.<br><br><a href="{RELEASES_URL}">{RELEASES_URL}</a>'
+            "FFmpeg is the only extra component it installs, and only after asking."
+            "<br><br>Help - Check for ClipDock updates asks GitHub whether a newer "
+            f"release exists. A newer release can be downloaded and installed from "
+            f'there, after you choose Download; nothing installs by itself.'
+            f'<br><br><a href="{RELEASES_URL}">{RELEASES_URL}</a>'
             "<br><br>MIT licensed. Not affiliated with YouTube.",
         )
 
@@ -3211,6 +3297,8 @@ class MainWindow(QMainWindow):
         and the Pause button stays dead for it.
         """
 
+        self._pending_resume = None
+        self._pending_resume_info = None
         self._pauseable = True
         self._pausing = False
         self._active_request = request
@@ -3271,10 +3359,10 @@ class MainWindow(QMainWindow):
         whole of what the button means.  yt-dlp has no pause primitive to call,
         so the stop is the same stop Cancel performs -- which is also why the
         partial file can still be locked for as long as the worker lives.  What
-        the app can promise is that nothing is deleted and that Resume is
-        offered afterwards if there is anything real to continue; that the next
-        run then continues at the byte it reached rather than starting over is
-        **not** established, and no wording here claims otherwise.
+        the app promises is that nothing is deleted, that Resume appears only
+        when there is something real to continue, and that the continuation
+        reads the pieces already on disk instead of starting over.  History
+        offers the same continuation after a restart, from the same pieces.
         """
 
         if not self.controller.is_running or not self._pauseable:
@@ -3400,10 +3488,32 @@ class MainWindow(QMainWindow):
         self.status_label.setText(" · ".join(details))
 
     def _on_job_thread_finished(self) -> None:
-        if not self.controller.is_running:
-            self._set_busy(False)
+        if self.controller.is_running:
+            return
+        self._set_busy(False)
+        # A history Resume/Retry re-reads the video or playlist first, because a
+        # request cannot be rebuilt without the qualities YouTube is offering
+        # now.  The probe's own result was stored by `_on_job_succeeded`; this
+        # is where it becomes the download the button promised.
+        if self._pending_resume is not None and self._pending_resume_info is not None:
+            self._continue_history_replay()
+
+    @staticmethod
+    def _format_duration(seconds: float | None) -> str:
+        if seconds is None:
+            return ""
+        total = int(seconds)
+        hours, remainder = divmod(total, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:d}:{seconds:02d}"
 
     def _on_job_succeeded(self, result: Any) -> None:
+        if getattr(self, "_pending_resume", None) is not None and isinstance(result, (PlaylistInfo, VideoInfo)):
+            self._pending_resume_info = result
+            return
+
         if isinstance(result, VideoInfo):
             self.playlist_info = None
             self.info = result
@@ -3486,9 +3596,34 @@ class MainWindow(QMainWindow):
             self._apply_queue_results(result)
             return
 
-        # Claimed before the DownloadResult branch below, which would otherwise
-        # treat a finished check as a finished download and report "Download
-        # complete" with no file to show.
+        # A download result is reported here only when we started it to install an
+        # update.  A finished download job is recorded by the normal path; an
+        # installer download must never become a history entry.
+        if getattr(self, "_pending_installer", False) and isinstance(result, DownloadedUpdate):
+            self._pending_installer = False
+            self._set_busy(False)
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(100)
+            self._progress_value = 100
+            if self._update_toast is not None:
+                self._update_toast.hide()
+            self.status_bar.showMessage("Starting the ClipDock installer", 8000)
+            started = launch_installer(result.path)
+            if not started:
+                QMessageBox.warning(
+                    self,
+                    "Could not start the installer",
+                    "The update was downloaded, but ClipDock could not start it. "
+                    f"The file is here:\n{result.path}",
+                )
+                return
+            # Give the installer time to start and close so Inno's
+            # CloseApplications can hand off cleanly.
+            self._closing = True
+            self.close()
+            return
+        self._pending_installer = False
+
         if isinstance(result, UpdateCheck):
             automatic = self._update_check_automatic
             self._update_check_automatic = False
@@ -3625,6 +3760,8 @@ class MainWindow(QMainWindow):
 
         if self._history_window is None:
             self._history_window = HistoryWindow(self)
+            self._history_window.resume_requested.connect(self._resume_from_history)
+            self._history_window.retry_requested.connect(self._retry_from_history)
         # Re-read on every opening rather than caching.  The file is small, it
         # is the only record, and a window that showed what the file said ten
         # minutes ago would be the same lie as not writing it down at all.
@@ -3658,6 +3795,8 @@ class MainWindow(QMainWindow):
         here is logged and the window moves on.
         """
 
+        if getattr(self, "_pending_installer", False):
+            return
         request = self._active_request
         if request is None:
             return
@@ -3794,16 +3933,345 @@ class MainWindow(QMainWindow):
 
         self._start_download_job(request, message, operation)
 
+    def _resume_from_history(self, job: dict[str, Any]) -> None:
+        """Continue the paused or interrupted job a history entry describes."""
+
+        self._replay_history_job(job)
+
+    def _retry_from_history(self, job: dict[str, Any]) -> None:
+        """Run the failed job a history entry describes again."""
+
+        self._replay_history_job(job)
+
+    def _replay_history_job(self, job: dict[str, Any]) -> None:
+        """Continue the job a history entry recorded, from the settings in it.
+
+        Resume and Retry differ in what happened before the entry - a stop that
+        kept its pieces, or a run that failed - and not at all in what has to
+        happen next.  Both replay the recorded request against whatever is left
+        in the hidden staging folder for that destination, which is why one
+        method serves both.
+
+        A queued batch is the only case that can begin without asking YouTube
+        anything: every link, and the one quality they share, is in the entry
+        already.  A single video and a playlist are re-read first because their
+        requests are built against the qualities offered now; a stale list would
+        make the engine quietly ignore the quality that was asked for.
+        """
+
+        if self.controller.is_running:
+            QMessageBox.information(
+                self,
+                "Already working",
+                "ClipDock is busy with another task. Try this when it has finished.",
+            )
+            return
+        stored = job.get("request") or {}
+        url = str(stored.get("url") or "").strip()
+        urls = tuple(str(link) for link in (stored.get("urls") or ()) if link)
+        output_dir = str(stored.get("output_dir") or "").strip()
+        if not output_dir:
+            QMessageBox.warning(
+                self,
+                "Cannot continue",
+                "This history entry does not say which folder it was saving to.",
+            )
+            return
+        if not url and not urls:
+            QMessageBox.warning(
+                self,
+                "Cannot continue",
+                "This history entry has no link left to try again.",
+            )
+            return
+        if self._history_window is not None and self._history_window.isVisible():
+            self._history_window.hide()
+
+        self.destination_edit.setText(output_dir)
+        if urls:
+            self._show_history_queue(job, urls)
+            return
+
+        mode = str(job.get("mode") or "")
+        self.url_edit.setText(url)
+        self._pending_resume = job
+        self._pending_resume_info = None
+        if mode == DownloadMode.PLAYLIST.value:
+            self._select_combo_value(self.mode_combo, DownloadMode.PLAYLIST.value)
+            self._select_combo_value(
+                self.playlist_media_combo,
+                str(stored.get("media") or PlaylistMedia.VIDEO.value),
+            )
+            self._restore_history_choices(stored)
+            self._mode_changed()
+            self.status_label.setText("Re-reading the playlist to continue the stopped job")
+            self._set_busy(True)
+            self._reset_progress_display()
+
+            def operation(progress: Any, cancel_check: Any) -> Any:
+                return self.engine.probe_playlist(url, progress=progress, cancel_check=cancel_check)
+
+            self.controller.start(operation)
+            return
+
+        self._select_combo_value(self.mode_combo, mode or DownloadMode.VIDEO.value)
+        self._restore_history_choices(stored)
+        self._mode_changed()
+        self.status_label.setText("Re-reading the video to continue the stopped job")
+        self._set_busy(True)
+        self._reset_progress_display()
+
+        def operation(progress: Any, cancel_check: Any) -> Any:
+            return self.engine.probe(url, progress=progress, cancel_check=cancel_check)
+
+        self.controller.start(operation)
+
+    def _show_history_queue(self, job: dict[str, Any], urls: tuple[str, ...]) -> None:
+        """Put a recorded batch back on screen and start it, without a probe."""
+
+        stored = job.get("request") or {}
+        joined = "\n".join(urls)
+        self._select_combo_value(self.mode_combo, DownloadMode.QUEUE.value)
+        self.url_edit.setText(joined)
+        self.queue_edit.setPlainText(joined)
+        self._select_combo_value(
+            self.queue_media_combo,
+            str(stored.get("media") or DownloadMode.VIDEO.value),
+        )
+        self._restore_history_choices(stored)
+        self._mode_changed()
+        self._reset_queue_rows()
+        self._start_history_queue(job, urls)
+
+    def _start_history_queue(self, job: dict[str, Any], urls: tuple[str, ...]) -> None:
+        """Start the batch a history entry recorded, with its own choices."""
+
+        stored = job.get("request") or {}
+        output_dir = Path(str(stored.get("output_dir")))
+        media = self._download_mode_from(stored.get("media"), DownloadMode.VIDEO)
+        quality = self._playlist_quality_from_stored(stored.get("quality"))
+        if media is DownloadMode.VIDEO and quality is None:
+            self._show_error(
+                "Cannot continue",
+                "This history entry does not say which video quality it used, so the batch "
+                "cannot be rebuilt as it was.",
+            )
+            return
+        bitrate = self._int_or_none(stored.get("audio_bitrate"))
+        request = QueueDownloadRequest(
+            urls=urls,
+            output_dir=output_dir,
+            media=media,
+            quality=quality if media is DownloadMode.VIDEO else None,
+            audio_bitrate=bitrate if media is DownloadMode.AUDIO else None,
+            preference=self._enum_from(StreamPreference, stored.get("preference"), StreamPreference.QUALITY),
+            subtitle_format=self._enum_from(SubtitleFormat, stored.get("subtitle_format"), SubtitleFormat.SRT),
+            subtitle_source=self._enum_from(SubtitleSource, stored.get("subtitle_source"), SubtitleSource.PREFERRED),
+            embed_cover=bool(stored.get("embed_cover", True)),
+        )
+
+        def operation(progress: Any, cancel_check: Any) -> Any:
+            return self.engine.download(request, progress=progress, cancel_check=cancel_check)
+
+        self._start_download_job(
+            request,
+            f"Continuing a batch of {len(urls)} link{'s' if len(urls) != 1 else ''}…",
+            operation,
+        )
+
+    def _continue_history_replay(self) -> None:
+        """Turn a finished re-fetch into the download that asked for it.
+
+        The probe exists only because a request cannot be rebuilt without the
+        details it was made against: the qualities, audio availability, and a
+        playlist's videos are all read from YouTube at the moment a job begins.
+        The recorded choices are then re-applied to that fresh answer, which is
+        the same thing Retry did before - the difference is only which outcome
+        preceded it.
+        """
+
+        job = self._pending_resume
+        info = self._pending_resume_info
+        self._pending_resume = None
+        self._pending_resume_info = None
+        if job is None or info is None or self.controller.is_running:
+            return
+        stored = job.get("request") or {}
+        folder = str(stored.get("output_dir") or "").strip()
+        if not folder:
+            self._show_error(
+                "Cannot continue",
+                "This history entry does not say which folder it was saving to.",
+            )
+            return
+        output_dir = Path(folder)
+        preference = self._enum_from(StreamPreference, stored.get("preference"), StreamPreference.QUALITY)
+        subtitle_format = self._enum_from(SubtitleFormat, stored.get("subtitle_format"), SubtitleFormat.SRT)
+        subtitle_source = self._enum_from(SubtitleSource, stored.get("subtitle_source"), SubtitleSource.PREFERRED)
+        embed_cover = bool(stored.get("embed_cover", True))
+        bitrate = self._int_or_none(stored.get("audio_bitrate"))
+
+        if isinstance(info, PlaylistInfo):
+            media = self._download_mode_from(stored.get("media"), DownloadMode.VIDEO)
+            try:
+                playlist_media = PlaylistMedia(media.value)
+            except ValueError:
+                playlist_media = PlaylistMedia.VIDEO
+            quality = self._playlist_quality_from(info, stored.get("quality"))
+            if playlist_media is PlaylistMedia.VIDEO and quality is None:
+                self._show_error(
+                    "Cannot continue",
+                    "The playlist no longer offers the video quality this job was using.",
+                )
+                return
+            selected = stored.get("selected_video_ids") or ()
+            selected_ids = tuple(str(video_id) for video_id in selected) or None
+            request = PlaylistDownloadRequest(
+                url=info.normalized_url or self.url_edit.text().strip(),
+                output_dir=output_dir,
+                info=info,
+                quality=quality if playlist_media is PlaylistMedia.VIDEO else None,
+                media=playlist_media,
+                audio_bitrate=bitrate if playlist_media is PlaylistMedia.AUDIO else None,
+                selected_video_ids=selected_ids,
+                preference=preference,
+                subtitle_format=subtitle_format,
+                subtitle_source=subtitle_source,
+                embed_cover=embed_cover,
+            )
+
+            def operation(progress: Any, cancel_check: Any) -> Any:
+                return self.engine.download_playlist(request, progress=progress, cancel_check=cancel_check)
+
+            self._start_download_job(request, "Continuing the playlist download…", operation)
+            return
+
+        mode = self._download_mode_from(stored.get("mode"), DownloadMode.VIDEO)
+        quality = self._video_quality_from(info, stored.get("quality"))
+        if mode is DownloadMode.VIDEO and quality is None:
+            self._show_error(
+                "Cannot continue",
+                "The video no longer offers the quality this job was using.",
+            )
+            return
+        request = DownloadRequest(
+            url=info.normalized_url or self.url_edit.text().strip(),
+            output_dir=output_dir,
+            mode=mode,
+            info=info,
+            quality=quality if mode is DownloadMode.VIDEO else None,
+            audio_bitrate=bitrate if mode is DownloadMode.AUDIO else None,
+            preference=preference,
+            subtitle_format=subtitle_format,
+            subtitle_source=subtitle_source,
+            subtitle_language=str(stored.get("subtitle_language") or ""),
+            embed_cover=embed_cover,
+        )
+
+        def operation(progress: Any, cancel_check: Any) -> Any:
+            return self.engine.download(request, progress=progress, cancel_check=cancel_check)
+
+        self._start_download_job(request, "Continuing the download…", operation)
+
+    def _restore_history_choices(self, stored: dict[str, Any]) -> None:
+        """Put a recorded job's non-quality choices back on screen.
+
+        The engine is given the recorded request directly; this only keeps the
+        window from showing settings the running job is not using.
+        """
+
+        self._select_combo_value(
+            self.stream_preference_combo,
+            str(stored.get("preference") or StreamPreference.QUALITY.value),
+        )
+        self._select_combo_value(
+            self.subtitle_format_combo,
+            str(stored.get("subtitle_format") or SubtitleFormat.SRT.value),
+        )
+        self._select_combo_value(
+            self.subtitle_source_combo,
+            str(stored.get("subtitle_source") or SubtitleSource.PREFERRED.value),
+        )
+        self.embed_cover_checkbox.setChecked(bool(stored.get("embed_cover", True)))
+
     @staticmethod
-    def _format_duration(seconds: float | None) -> str:
-        if seconds is None:
-            return ""
-        total = int(seconds)
-        hours, remainder = divmod(total, 3600)
-        minutes, seconds = divmod(remainder, 60)
-        if hours:
-            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
-        return f"{minutes:d}:{seconds:02d}"
+    def _select_combo_value(combo: Any, value: Any) -> None:
+        for index in range(combo.count()):
+            if combo.itemData(index) == value:
+                combo.setCurrentIndex(index)
+                return
+
+    @staticmethod
+    def _download_mode_from(value: Any, fallback: DownloadMode) -> DownloadMode:
+        try:
+            return DownloadMode(str(value))
+        except ValueError:
+            return fallback
+
+    @staticmethod
+    def _enum_from(enum_type: Any, value: Any, fallback: Any) -> Any:
+        try:
+            return enum_type(str(value))
+        except ValueError:
+            return fallback
+
+    @staticmethod
+    def _int_or_none(value: Any) -> int | None:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _video_quality_from(info: VideoInfo, stored: Any) -> VideoQuality | None:
+        """Match a recorded quality against what the video offers now.
+
+        The format id is tried first because it identifies one stream exactly.
+        Height is the fallback, because YouTube retires ids routinely and a
+        resumed job should survive that; the nearest frame rate breaks a tie
+        between, say, 1080p60 and 1080p30.
+        """
+
+        if not isinstance(stored, dict):
+            return None
+        format_id = str(stored.get("format_id") or "")
+        if format_id:
+            for quality in info.qualities:
+                if quality.format_id == format_id:
+                    return quality
+        height = stored.get("height")
+        if height is None:
+            return None
+        candidates = [quality for quality in info.qualities if int(quality.height) == int(height)]
+        if not candidates:
+            return None
+        frame_rate = stored.get("fps") or 0
+        return min(candidates, key=lambda quality: abs((quality.fps or 0) - float(frame_rate)))
+
+    @staticmethod
+    def _playlist_quality_from(info: PlaylistInfo, stored: Any) -> PlaylistQuality | None:
+        if not isinstance(stored, dict):
+            return None
+        height = stored.get("height")
+        if height is None:
+            return info.qualities[0] if len(info.qualities) == 1 else None
+        candidates = [quality for quality in info.qualities if int(quality.height) == int(height)]
+        if not candidates:
+            return None
+        frame_rate = stored.get("fps") or 0
+        return min(candidates, key=lambda quality: abs((quality.fps or 0) - float(frame_rate)))
+
+    @staticmethod
+    def _playlist_quality_from_stored(stored: Any) -> PlaylistQuality | None:
+        if not isinstance(stored, dict):
+            return None
+        height = stored.get("height")
+        if height is None:
+            return None
+        try:
+            return PlaylistQuality(height=int(height), fps=stored.get("fps"))
+        except (TypeError, ValueError):
+            return None
 
     def _on_job_failed(self, error: Any) -> None:
         # Consumed first, so a failure cannot leave the *next* check - which
@@ -3811,6 +4279,15 @@ class MainWindow(QMainWindow):
         # program had raised its hand on its own.
         automatic = self._update_check_automatic
         self._update_check_automatic = False
+        # A re-fetch for a history Resume/Retry that failed leaves nothing to
+        # continue, so the pending job is dropped rather than left to hijack
+        # whatever the person tries next.
+        self._pending_resume = None
+        self._pending_resume_info = None
+        # A failed installer download is still a finished attempt at one.  If
+        # the flag survived, `_record_history` would keep treating every later
+        # job as an installer download and write none of them down.
+        self._pending_installer = False
         if automatic:
             # `check_for_updates` documents that it never raises and turns
             # every failure into a result, so this should be unreachable.  It
@@ -3843,24 +4320,40 @@ class MainWindow(QMainWindow):
         # A stop that was asked for by Pause still ends as a cancellation as far
         # as the worker is concerned; only the wording differs, and only here.
         self._update_check_automatic = False
+        # The same applies to a cancel: a re-fetch stopped before its download
+        # began must not continue on the next probe.
+        self._pending_resume = None
+        self._pending_resume_info = None
+        self._pending_installer = False
         paused = self._pausing
         self._pausing = False
         # A Pause is a job that stopped and may be continued; a Cancel is one
-        # that stopped and will not be.  Both are written down, because a
-        # download that ran for ten minutes and then stopped is exactly the
-        # thing somebody wants to see accounted for later, and neither can be
-        # listed file by file - nothing here watched which files this job owns.
+        # that stopped and will not be.  The window being closed while a download
+        # is running is neither: the person did not choose to stop it, so it is
+        # recorded as interrupted.  Both are written down, because a download
+        # that ran for ten minutes and then stopped is exactly the thing somebody
+        # wants to see accounted for later, and neither can be listed file by file
+        # - nothing here watched which files this job owns.
         #
         # The reasons are written to sit *after* the outcome rather than repeat
-        # it: the row already says "Paused" or "Cancelled", so a reason that
-        # began "Stopped..." would be the same sentence twice.
-        self._record_history(
-            None,
-            outcome=OUTCOME_PAUSED if paused else OUTCOME_CANCELLED,
-            reason="the pieces already written were kept" if paused else "",
-        )
+        # it: the row already says the state, so a reason that began "Stopped..."
+        # would be the same sentence twice.
+        if getattr(self, "_closing", False) and not paused:
+            self._record_history(
+                None,
+                outcome=OUTCOME_INTERRUPTED,
+                reason="the window was closed before it finished",
+            )
+        else:
+            self._record_history(
+                None,
+                outcome=OUTCOME_PAUSED if paused else OUTCOME_CANCELLED,
+                reason="the pieces already written were kept" if paused else "",
+            )
         if paused:
             self._set_busy(False, "Paused - what had downloaded so far is kept")
+        elif getattr(self, "_closing", False):
+            self._set_busy(False, "Interrupted")
         else:
             self._set_busy(False, "Cancelled")
         self.progress_bar.setRange(0, 100)
@@ -3929,6 +4422,7 @@ class MainWindow(QMainWindow):
             if answer != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            self._closing = True
             self.controller.cancel()
             stopped = self.controller.wait(10_000)
             if stopped:
@@ -3946,7 +4440,7 @@ class MainWindow(QMainWindow):
         # Only once the close is actually going ahead: a refused close leaves
         # the window up, and the check should still be waiting for it.
         self._update_check_timer.stop()
-        if self._update_toast is not None:
+        if getattr(self, "_update_toast", None) is not None:
             self._update_toast.hide()
         # The history is a child window, and a child left open keeps the
         # application running after the only window anybody is using has gone.

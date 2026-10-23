@@ -82,6 +82,11 @@ OUTCOME_PARTIAL = "partial"
 OUTCOME_FAILED = "failed"
 OUTCOME_PAUSED = "paused"
 OUTCOME_CANCELLED = "cancelled"
+# The window was closed while the job was running.  Distinct from "cancelled"
+# because the person did not choose to stop this download, and distinct from
+# "paused" because they did not choose to keep it for later either - it is the
+# truth of what happened, and it is the one state a crash cannot record.
+OUTCOME_INTERRUPTED = "interrupted"
 
 # Outcomes an individual *file* can have.
 ITEM_SAVED = "saved"
@@ -103,6 +108,9 @@ _REQUEST_SETTING_NAMES = (
     "subtitle_source",
     "subtitle_language",
     "embed_cover",
+    # Without this a playlist resumed in a later session cannot know which of
+    # its videos were ticked, and would re-run the whole list.
+    "selected_video_ids",
 )
 
 
