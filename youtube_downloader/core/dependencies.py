@@ -63,8 +63,8 @@ FFMPEG_URL = (
     "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
     "ffmpeg-master-latest-win64-gpl.zip"
 )
-FFMPEG_ARCHIVE_SHA256 = "d12357d3823203c176a5b94bfcdbd8f6d9a76de6d05101e766e851da2fee1a51"
-FFMPEG_BINARY_SHA256 = "63f7cad2da68519366eee578ee2bcebb09b2bde58b06a410ef4bbf4fc00e2d2c"
+FFMPEG_ARCHIVE_SHA256 = "a460427e8fd8ab9aa9c274ee4029f90e9084d093e6b14a35fb5cc89a7a549663"
+FFMPEG_BINARY_SHA256 = "1de66cffd7656f4d05e00cc5f46cddcdf97dfd9513103cff9770725eaaaccf55"
 
 # The archive carries every configuration BtbN publishes, which is why it is so
 # much larger than the single binary that is actually kept.  This is the size
