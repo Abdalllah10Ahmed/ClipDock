@@ -46,7 +46,7 @@ jobs:
           key: vendor-${{ runner.os }}-${{ hashFiles('tools/fetch_dependencies.py', 'youtube_downloader/core/dependencies.py') }}
 
       - name: Fetch and verify the Windows binaries
-        run: python tools/fetch_dependencies.py
+        run: python tools/fetch_dependencies.py --force
 
       # A developer machine with QT_QPA_FONTDIR set renders differently; the
       # suite has been bitten by that.  A clean runner has no such variable,
