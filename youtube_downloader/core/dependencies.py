@@ -57,14 +57,15 @@ _LOGGER = logging.getLogger(__name__)
 # uses to build the vendor folder, and that tool imports them from here rather
 # than repeating them, so a build can never ship a binary the application would
 # then refuse to install.
-FFMPEG_VERSION = "master"
-FFMPEG_BUILD = "latest"
+FFMPEG_VERSION = "9.0.2"
+FFMPEG_BUILD = "n9.0.2-45-g1e65c6cd5d"
 FFMPEG_URL = (
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/"
-    "ffmpeg-master-latest-win64-gpl.zip"
+    "https://github.com/BtbN/FFmpeg-Builds/releases/download/"
+    "autobuild-2026-11-02-12-51/"
+    "ffmpeg-n9.0.2-45-g1e65c6cd5d-win64-gpl-9.0.zip"
 )
-FFMPEG_ARCHIVE_SHA256 = "a460427e8fd8ab9aa9c274ee4029f90e9084d093e6b14a35fb5cc89a7a549663"
-FFMPEG_BINARY_SHA256 = "1de66cffd7656f4d05e00cc5f46cddcdf97dfd9513103cff9770725eaaaccf55"
+FFMPEG_ARCHIVE_SHA256 = "20e6537e293473506d79ef4a6b203bc6b9735a9d3d225c28e05ef968b3438116"
+FFMPEG_BINARY_SHA256 = "52c1b59d92a82ac8157fdc5ac056d33fd8c206362fbdd9bc6a48831e6f0e9651"
 
 # The archive carries every configuration BtbN publishes, which is why it is so
 # much larger than the single binary that is actually kept.  This is the size
