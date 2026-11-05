@@ -39,12 +39,6 @@ jobs:
       # checkout without vendor\ is not the same suite.  The cache key is the
       # SHA-256 pins themselves: if a pin changes, the archive is fetched again
       # and verified rather than trusted.
-      - name: Restore the fetched Windows binaries
-        uses: actions/cache@v4
-        with:
-          path: vendor
-          key: vendor-${{ runner.os }}-${{ hashFiles('tools/fetch_dependencies.py', 'youtube_downloader/core/dependencies.py') }}
-
       - name: Fetch and verify the Windows binaries
         run: python tools/fetch_dependencies.py --force
 
