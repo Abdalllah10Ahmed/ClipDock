@@ -40,7 +40,10 @@ jobs:
       # SHA-256 pins themselves: if a pin changes, the archive is fetched again
       # and verified rather than trusted.
       - name: Fetch and verify the Windows binaries
-        run: python tools/fetch_dependencies.py --force
+        run: |
+          if (Test-Path vendor) { Remove-Item vendor -Recurse -Force }
+          python tools/fetch_dependencies.py --force
+        shell: pwsh
 
       # A developer machine with QT_QPA_FONTDIR set renders differently; the
       # suite has been bitten by that.  A clean runner has no such variable,
