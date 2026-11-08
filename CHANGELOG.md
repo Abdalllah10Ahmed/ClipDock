@@ -13,6 +13,24 @@ Release artefacts are attached to GitHub Releases rather than committed. The
 installer for a release is `ClipDock-Setup.exe`; verify it against the SHA-256
 printed at the end of `scripts/build_installer.ps1`.
 
+## [0.4.1] - 2026-11-08
+
+A small maintenance build on top of 0.4.0 for local testing: it carries the
+post-0.4.0 fixes already on `main` (FFmpeg pinning, CI reliability, and a
+regenerated app icon). No user-facing feature changes beyond those fixes.
+
+### Fixed
+
+- **FFmpeg is pinned to a stable, verifiable BtbN build.** The moving
+  `latest`/`master` FFmpeg download could change checksums and break fetch/CI.
+  0.4.1 pins FFmpeg to a stable BtbN autobuild (`autobuild-2026-11-02-12-51`,
+  FFmpeg 9.0.2 GPL win64) with verified archive and binary SHA-256 values.
+- **CI fetches verified Windows binaries reliably.** The CI workflow now cleans
+  any stale `vendor` contents and runs `tools/fetch_dependencies.py --force`,
+  avoiding checksum mismatches from cached/moving artifacts.
+- **The checked-in app icon matches the generator.** `assets/app.ico` was
+  regenerated so the icon tests and packaged assets stay consistent.
+
 ## [0.4.0] - 2026-10-23
 
 One release for the eight things 0.3.0 left undone or got wrong: a download that
@@ -262,7 +280,8 @@ First public release. Everything below is new.
 - No runtime dependency beyond PySide6 and yt-dlp; both are bundled. FFmpeg is
   the only thing ever downloaded, and only after asking.
 
-[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.1.0...v0.2.0
