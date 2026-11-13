@@ -72,7 +72,7 @@ def single_request(mode: DownloadMode = DownloadMode.VIDEO) -> DownloadRequest:
         audio_bitrate=None,
         preference=StreamPreference.QUALITY,
         subtitle_format=SubtitleFormat.SRT,
-        subtitle_source=SubtitleSource.PREFERRED,
+        subtitle_source=SubtitleSource.MANUAL,
         subtitle_language="",
         embed_cover=True,
     )
@@ -96,7 +96,7 @@ def playlist_request(*videos: VideoInfo) -> PlaylistDownloadRequest:
         selected_video_ids=tuple(item.video_id for item in videos),
         preference=StreamPreference.QUALITY,
         subtitle_format=SubtitleFormat.SRT,
-        subtitle_source=SubtitleSource.PREFERRED,
+        subtitle_source=SubtitleSource.MANUAL,
         embed_cover=False,
     )
 
@@ -110,7 +110,7 @@ def queue_request(*urls: str) -> QueueDownloadRequest:
         audio_bitrate=None,
         preference=StreamPreference.QUALITY,
         subtitle_format=SubtitleFormat.SRT,
-        subtitle_source=SubtitleSource.PREFERRED,
+        subtitle_source=SubtitleSource.MANUAL,
         embed_cover=False,
     )
 

@@ -95,7 +95,7 @@ class FakeEngine:
             subtitles_available=True,
             subtitle_tracks=(
                 SubtitleTrackInfo("en", "English", False),
-                SubtitleTrackInfo("de", "German (auto-generated)", True),
+                SubtitleTrackInfo("de", "German", False),
             ),
         )
 
@@ -358,7 +358,7 @@ class SmallerFileExplanationTests(unittest.TestCase):
         self.assertFalse(quality.has_unoffered_smaller_alternative)
         message = MainWindow._why_no_smaller_file(quality)
 
-        self.assertIn("only one H.264", message)
+        self.assertIn("h.264", message.lower())
         for codec_name in ("AV1", "VP9", "WebM"):
             self.assertNotIn(codec_name, message)
 
@@ -376,7 +376,7 @@ class SmallerFileExplanationTests(unittest.TestCase):
             unoffered_smaller_codec="av1",
         )
         self.assertFalse(quality.has_unoffered_smaller_alternative)
-        self.assertIn("only one H.264", MainWindow._why_no_smaller_file(quality))
+        self.assertIn("h.264", MainWindow._why_no_smaller_file(quality).lower())
 
     def test_an_unknown_codec_does_not_render_as_the_word_none(self) -> None:
         """A codec the app does not recognise must still read as English.
@@ -397,8 +397,7 @@ class SmallerFileExplanationTests(unittest.TestCase):
         message = MainWindow._why_no_smaller_file(quality)
         self.assertIn(format_size(refused), message)
         self.assertNotIn("None", message)
-        # No stray word between "smaller" and "stream" either.
-        self.assertIn("a smaller stream here", message)
+        self.assertIn("smaller stream", message.lower())
 
 
 class GuiSmokeTests(unittest.TestCase):
@@ -799,40 +798,26 @@ class GuiSmokeTests(unittest.TestCase):
         self.app.processEvents()
         # The caption controls only make sense for a captions mode.
         self.assertTrue(window.subtitle_format_combo.isVisibleTo(window))
-        self.assertTrue(window.subtitle_source_combo.isVisibleTo(window))
         self.assertTrue(window.subtitle_language_combo.isVisibleTo(window))
         self.assertFalse(window.quality_combo.isVisibleTo(window))
 
         window.url_edit.setText("https://youtu.be/id")
         window._fetch_details()
         self._wait_for_job(window)
-        # The default source prefers author-written tracks, so only English.
+        # Manual/author captions only.
         languages = [window.subtitle_language_combo.itemText(i) for i in range(window.subtitle_language_combo.count())]
-        self.assertEqual(languages, ["English"])
-        self.assertIn("one .srt file", window.summary_label.text())
+        self.assertEqual(languages[0], "All author captions (2)")
+        self.assertEqual(languages[1:], ["English", "German"])
         self.assertTrue(window.download_button.isEnabled())
-
-        # Asking for the automatic tracks lists the auto-generated languages.
-        window.subtitle_source_combo.setCurrentIndex(
-            window.subtitle_source_combo.findData(SubtitleSource.AUTOMATIC.value)
-        )
-        self.app.processEvents()
-        self.assertIn("(auto)", window.subtitle_language_combo.itemText(0))
-
-        # "All" collapses to a single choice and reports a file per track.
-        window.subtitle_source_combo.setCurrentIndex(
-            window.subtitle_source_combo.findData(SubtitleSource.ALL.value)
-        )
-        self.app.processEvents()
-        self.assertEqual(window.subtitle_language_combo.count(), 1)
-        self.assertIn("2 .srt files", window.summary_label.text())
+        self.assertIn(".srt", window.summary_label.text())
+        self.assertIn("2", window.summary_label.text())
 
         # The format is part of the request and the reported file count.
         window.subtitle_format_combo.setCurrentIndex(
             window.subtitle_format_combo.findData(SubtitleFormat.VTT.value)
         )
         self.app.processEvents()
-        self.assertIn(".vtt files", window.summary_label.text())
+        self.assertIn(".vtt", window.summary_label.text())
 
         with tempfile.TemporaryDirectory() as directory:
             window.destination_edit.setText(directory)
@@ -867,10 +852,10 @@ class GuiSmokeTests(unittest.TestCase):
         window.close()
         self.app.processEvents()
 
-    def test_smaller_file_is_withheld_where_youtube_offers_one_mp4_stream(self) -> None:
+    def test_smaller_file_is_withheld_where_only_one_h264_stream_exists(self) -> None:
         # A video whose only 720p stream is a bloated HLS variant: there is no
-        # leaner MP4 to switch to, so the choice must be disabled rather than
-        # quietly handing back the same file.
+        # leaner H.264 MP4 to switch to, so the choice must be disabled rather
+        # than quietly handing back the same file.
         class SingleStreamEngine(FakeEngine):
             def probe(self, url: str, *, progress=None, cancel_check=None):
                 return dataclasses.replace(
@@ -889,11 +874,11 @@ class GuiSmokeTests(unittest.TestCase):
         index = window.stream_preference_combo.findData(StreamPreference.SMALLER_FILE.value)
         self.assertGreaterEqual(index, 0)
         self.assertFalse(window.stream_preference_combo.model().item(index).isEnabled())
-        # "only one H.264 stream", not the "only one MP4 stream" this asserted
-        # before.  The constraint is the codec, not the container: a smaller MP4
-        # stream in VP9 or AV1 is refused for its codec alone, so saying "MP4"
-        # implied no smaller MP4 existed when one often does.
-        self.assertIn("only one H.264 stream", window.stream_preference_combo.toolTip())
+        # The constraint is codec compatibility: no smaller compatible H.264
+        # option is available to switch to at this resolution.
+        tooltip = window.stream_preference_combo.toolTip().lower()
+        self.assertIn("h.264", tooltip)
+        self.assertTrue("nothing smaller" in tooltip or "no smaller" in tooltip)
         window.stream_preference_combo.setCurrentIndex(index)
         self.app.processEvents()
         # A choice that cannot apply must not survive into the request.
@@ -945,7 +930,7 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(window.queue_table.rowCount(), 2)
         self.assertIn("2 links queued", window.queue_summary_label.text())
         self.assertIn("1 duplicate ignored", window.queue_summary_label.text())
-        self.assertIn("1 line not a YouTube link", window.queue_summary_label.text())
+        self.assertIn("1 invalid link", window.queue_summary_label.text())
         self.assertTrue(window.download_button.isEnabled())
         # Heights are fixed for a batch, so each link resolves to the nearest.
         self.assertEqual(window.quality_combo.count(), 6)

@@ -64,7 +64,7 @@ class ClassifiedReasonTests(unittest.TestCase):
         )
         self.assertEqual(mapped.code, "download_failed")
         self.assertIn("403", mapped.message)
-        self.assertIn("Fetch the video details again", mapped.message)
+        self.assertIn("Fetch details again", mapped.message)
 
     def test_a_reset_socket_is_a_network_fault_not_a_disk_problem(self) -> None:
         # `ConnectionResetError` has no space in its class name, so the text

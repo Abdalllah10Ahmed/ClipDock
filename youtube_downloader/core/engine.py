@@ -53,8 +53,9 @@ from .models import (
     VideoQuality,
     codec_family_of,
     estimate_audio_size_bytes,
+    format_size,
 )
-from .urls import UrlValidationError, normalize_youtube_playlist_url, normalize_youtube_url
+from .urls import UrlValidationError, normalize_media_url, normalize_playlist_url
 
 SUPPORTED_PLAYLIST_AUDIO_BITRATES = (128, 192, 256, 320)
 
@@ -194,8 +195,8 @@ _QUEUE_SUPPORTED_MODES = (
     DownloadMode.SUBTITLES,
 )
 
-# Pause between caption fetches when a run covers several languages.  YouTube's
-# timedtext endpoint begins answering HTTP 429 partway through an unpaced run.
+# Pause between caption fetches when a run covers several languages.  Some
+# caption endpoints begin answering HTTP 429 partway through an unpaced run.
 CAPTION_REQUEST_INTERVAL = 0.6
 
 # yt-dlp cannot retry a throttled request at all, so the retry has to be here.
@@ -428,7 +429,7 @@ def select_playlist_videos(
     """Apply a per-video selection, preserving playlist order.
 
     ``None`` means every video is selected.  Duplicate titles are irrelevant
-    because selection is keyed by the stable YouTube video id.
+    because selection is keyed by the stable video id.
     """
 
     if selected_video_ids is None:
@@ -770,7 +771,7 @@ class Engine:
                 relay.emit(
                     "waiting",
                     None,
-                    "YouTube did not answer - trying again",
+                    "The site did not answer - trying again,",
                     force=True,
                 )
                 self._wait_before_retry(wait, relay)
@@ -784,9 +785,9 @@ class Engine:
         cancel_check: CancelCheck | None = None,
     ) -> VideoInfo:
         relay = _ProgressRelay(progress, cancel_check)
-        relay.emit("probing", 0.0, "Fetching video details", force=True)
+        relay.emit("probing", 0.0, "Fetching media details", force=True)
         try:
-            normalized_url = normalize_youtube_url(raw_url)
+            normalized_url = normalize_media_url(raw_url)
             options = self._base_options(Path.cwd(), relay)
             options.update({"skip_download": True, "extract_flat": False})
 
@@ -798,8 +799,12 @@ class Engine:
             raw_info = self._fetch_with_retries(extract, relay, operation="probe")
             relay.check_cancelled()
             info = self._build_video_info(raw_info, normalized_url)
-            relay.emit("probing", 100.0, "Video details ready", force=True)
-            self._logger.info("probe_completed qualities=%d thumbnail=%s", len(info.qualities), bool(info.thumbnail_url))
+            relay.emit("probing", 100.0, "Media details ready", force=True)
+            self._logger.info(
+                "probe_completed qualities=%d thumbnail=%s",
+                len(getattr(info, "qualities", ())),
+                bool(getattr(info, "thumbnail_url", None)),
+            )
             return info
         except UrlValidationError as error:
             raise ExtractionError(str(error), code="invalid_url") from error
@@ -821,7 +826,7 @@ class Engine:
         relay = _ProgressRelay(progress, cancel_check)
         relay.emit("probing", 0.0, "Fetching playlist details", force=True)
         try:
-            normalized_url = normalize_youtube_playlist_url(raw_url)
+            normalized_url = normalize_playlist_url(raw_url)
             options = self._base_options(Path.cwd(), relay)
             options.update({"skip_download": True, "extract_flat": False, "noplaylist": False})
 
@@ -851,27 +856,74 @@ class Engine:
 
     def _build_video_info(self, raw_info: Any, normalized_url: str) -> VideoInfo:
         if not isinstance(raw_info, dict):
-            raise ExtractionError("YouTube returned no video information.", code="empty_metadata")
-        if raw_info.get("_type") in {"playlist", "multi_video"}:
-            raise UnsupportedContentError("Playlist and channel links are not supported in this version.")
-        if raw_info.get("entries") is not None and not raw_info.get("formats"):
-            raise UnsupportedContentError("Playlist and channel links are not supported in this version.")
+            raise ExtractionError("The site returned no media information.", code="empty_metadata")
+        if raw_info.get("_type") in {"playlist", "multi_video"} or (
+            raw_info.get("entries") is not None and not raw_info.get("formats")
+        ):
+            raise UnsupportedContentError(
+                "This is a playlist or collection link. Use Playlist mode for supported playlists."
+            )
 
-        video_id = str(raw_info.get("id") or "").strip()
+        video_id = str(raw_info.get("id") or raw_info.get("display_id") or "").strip()
         if not video_id:
-            raise ExtractionError("YouTube returned a video without a usable identifier.", code="missing_video_id")
-        title = " ".join(str(raw_info.get("title") or "YouTube video").split())
+            raise ExtractionError("The site returned media without a usable identifier.", code="missing_video_id")
+        title = " ".join(str(raw_info.get("title") or raw_info.get("fulltitle") or "Media").split())
         duration = self._as_float(raw_info.get("duration"))
-        qualities = self._build_qualities(raw_info.get("formats") or [], duration=duration)
+        formats = raw_info.get("formats") or []
+        qualities = self._build_qualities(formats, duration=duration)
         audio_available = any(
             isinstance(fmt, dict) and str(fmt.get("acodec") or "none").lower() != "none"
-            for fmt in raw_info.get("formats") or []
+            for fmt in formats
         )
         if not audio_available and str(raw_info.get("acodec") or "none").lower() != "none":
             audio_available = True
+        # Some extractors expose generic progressive formats (e.g. sd/hd) without
+        # codec metadata; allow download attempts and let engine/reporting handle
+        # true capability limits.
+        if not audio_available and qualities:
+            audio_available = any(
+                isinstance(fmt, dict)
+                and (
+                    str(fmt.get("acodec") or "none").lower() != "none"
+                    or str(fmt.get("format_id") or "").lower() in {"sd", "hd"}
+                    or (str(fmt.get("vcodec") or "none").lower() != "none" and fmt.get("url"))
+                )
+                for fmt in formats
+            )
         thumbnail_url = self._largest_thumbnail(raw_info.get("thumbnails"))
         if not thumbnail_url and raw_info.get("thumbnail"):
             thumbnail_url = str(raw_info["thumbnail"])
+        direct_url = raw_info.get("url")
+        direct_ext = str(raw_info.get("ext") or "").lower()
+        # Direct image/media URL cases.
+        if not qualities and direct_url and direct_ext in {"jpg", "jpeg", "png", "webp", "gif", "bmp", "avif"}:
+            thumbnail_url = str(direct_url)
+        # Fallback: some sources expose a single downloadable media URL without
+        # standard format/height metadata.
+        if not qualities and direct_url and direct_ext in {"mp4", "m4v", "webm", "mkv", "mov"}:
+            est = None
+            size = self._as_float(raw_info.get("filesize") or raw_info.get("filesize_approx"))
+            if size and size > 0:
+                est = int(size)
+            elif duration and duration > 0:
+                tbr = self._as_float(raw_info.get("tbr") or raw_info.get("vbr"))
+                if tbr and tbr > 0:
+                    est = int(duration * tbr * 1000 / 8)
+            qualities = [
+                VideoQuality(
+                    format_id="best",
+                    height=720,
+                    fps=self._as_float(raw_info.get("fps")),
+                    has_audio=str(raw_info.get("acodec") or "none").lower() != "none",
+                    width=int(self._as_float(raw_info.get("width")) or 0) or None,
+                    extension=direct_ext,
+                    estimated_size_bytes=est,
+                )
+            ]
+            if not audio_available and qualities[0].has_audio:
+                audio_available = True
+            if not audio_available:
+                audio_available = True
         subtitle_tracks = self._build_subtitle_tracks(raw_info)
         return VideoInfo(
             video_id=video_id,
@@ -886,112 +938,99 @@ class Engine:
             subtitle_tracks=subtitle_tracks,
         )
 
+    def _build_info_from_entries(self, raw_info: dict[str, Any], normalized_url: str) -> VideoInfo | None:
+        entries = raw_info.get("entries")
+        if entries is None:
+            return None
+        try:
+            items = [e for e in entries if e]
+        except TypeError:
+            return None
+        if not items:
+            return None
+        first = items[0] if isinstance(items[0], dict) else None
+        # Single-entry collection (common for some posts/reels wrappers): probe as media
+        # only when the entry itself carries usable media info.
+        if len(items) == 1 and isinstance(first, dict):
+            entry_url = self._playlist_entry_url(first) or normalized_url
+            try:
+                if first.get("formats") or first.get("thumbnails") or first.get("thumbnail"):
+                    info = self._build_video_info(first, entry_url)
+                    if info.qualities or info.thumbnail_url or info.subtitles_available:
+                        return info
+                direct = first.get("url")
+                ext = str(first.get("ext") or "").lower()
+                if direct and ext in {"jpg", "jpeg", "png", "webp", "gif", "bmp", "avif", "mp4", "m4v", "webm", "mkv", "mov"}:
+                    info = self._build_video_info(first, entry_url)
+                    if info.qualities or info.thumbnail_url:
+                        return info
+            except AppError:
+                return None
+        # Image/gallery-like collections: expose thumbnail/image download when possible.
+        image_urls: list[str] = []
+        for e in items:
+            if not isinstance(e, dict):
+                continue
+            url = e.get("url") or e.get("thumbnail")
+            ext = str(e.get("ext") or "").lower()
+            if url and (ext in {"jpg", "jpeg", "png", "webp", "gif", "bmp", "avif"} or "image" in str(e.get("_type") or "").lower()):
+                image_urls.append(str(url))
+        if len(image_urls) >= 1 and raw_info.get("_type") in {"playlist", "multi_video"}:
+            video_id = str(raw_info.get("id") or raw_info.get("display_id") or "media").strip()
+            title = " ".join(str(raw_info.get("title") or raw_info.get("fulltitle") or "Media").split())
+            return VideoInfo(
+                video_id=video_id,
+                title=title,
+                duration=None,
+                thumbnail_url=image_urls[0],
+                qualities=(),
+                audio_available=False,
+                normalized_url=normalized_url,
+            )
+        return None
+
     @staticmethod
     def _build_subtitle_tracks(raw_info: dict[str, Any]) -> tuple[SubtitleTrackInfo, ...]:
-        """Collect the caption tracks yt-dlp advertised for this video.
+        """Collect manual/author-provided caption tracks advertised for this media.
 
-        Auto-generated tracks are only usable when the owner allows them, so
-        they are reported separately and the UI can explain the difference.
+        Auto-generated captions are intentionally ignored.
         """
 
         tracks: list[SubtitleTrackInfo] = []
-        seen: set[tuple[str, bool]] = set()
-        for field, automatic in (("subtitles", False), ("automatic_captions", True)):
-            container = raw_info.get(field)
-            if not isinstance(container, dict):
+        seen: set[str] = set()
+        container = raw_info.get("subtitles")
+        if not isinstance(container, dict):
+            return ()
+        for language_code, entries in container.items():
+            code = str(language_code or "").strip()
+            if not code or not isinstance(entries, list) or not entries or code in seen:
                 continue
-            for language_code, entries in container.items():
-                code = str(language_code or "").strip()
-                if not code or not isinstance(entries, list) or not entries:
-                    continue
-                if (code, automatic) in seen:
-                    continue
-                seen.add((code, automatic))
-                name = code
-                for entry in entries:
-                    if isinstance(entry, dict) and entry.get("name"):
-                        name = str(entry["name"])
-                        break
-                tracks.append(SubtitleTrackInfo(language_code=code, language_name=name, automatic=automatic))
+            seen.add(code)
+            name = code
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("name"):
+                    name = str(entry["name"])
+                    break
+            tracks.append(SubtitleTrackInfo(language_code=code, language_name=name))
         return tuple(tracks)
 
     @staticmethod
     def _subtitle_language_options(request: DownloadRequest, info: VideoInfo) -> list[str]:
-        """Decide which language codes yt-dlp should be asked to write.
-
-        ``SubtitleSource.AUTOMATIC`` targets the auto-generated tracks only,
-        ``PREFERRED`` targets author-written tracks and falls back to automatic
-        ones, and ``ALL`` writes every advertised track.
-
-        Every list derived from the advertised tracks is capped.  YouTube lists
-        well over a hundred of them, and every one past the video's own language
-        is a server-side machine translation, which the caption endpoint serves
-        far more reluctantly than the original: an uncapped run is refused part
-        way through.  A language the person picked by hand is never capped.
-        """
+        """Decide which manual caption language codes yt-dlp should write."""
 
         if request.subtitle_language:
             return [request.subtitle_language]
-        automatic = sorted({track.language_code for track in info.automatic_subtitle_tracks})
-        if request.subtitle_source is SubtitleSource.AUTOMATIC:
-            return automatic[:MAX_SUBTITLE_LANGUAGES]
-        if request.subtitle_source is SubtitleSource.ALL:
-            codes: list[str] = []
-            for track in (*info.manual_subtitle_tracks, *info.automatic_subtitle_tracks):
-                if track.language_code not in codes:
-                    codes.append(track.language_code)
-            return sorted(codes)[:MAX_SUBTITLE_LANGUAGES]
-        preferred = sorted({track.language_code for track in info.manual_subtitle_tracks})
-        return (preferred or automatic)[:MAX_SUBTITLE_LANGUAGES]
+        manual = sorted({track.language_code for track in info.manual_subtitle_tracks})
+        return manual[:MAX_SUBTITLE_LANGUAGES]
 
     @staticmethod
     def _subtitle_write_targets(
         request: DownloadRequest, languages: list[str]
     ) -> tuple[bool, bool]:
-        """Whether to write author-written captions, auto-generated ones, or both.
+        """Only manual/author-provided captions are written."""
 
-        yt-dlp prefers an author-written track whenever ``writesubtitles`` is on,
-        so asking for the ASR track alone has to turn that off - otherwise
-        "Auto-generated" quietly hands back the human track for every language
-        that has one.
-
-        The pair otherwise follows ``subtitle_source``, but "Author-written
-        first" is a statement of preference in terms of track *quality*, not a
-        filter over track kind, and its ``help_text`` promises to "fall back to
-        auto-generated ones when a language has no human track".  So for that
-        source the pair is resolved from what the video actually advertises for
-        the languages being asked for.
-
-        Without that resolution the promise is not kept in either direction, and
-        both failures are silent because nothing is written and the run ends
-        with "The requested SRT file was not produced" - a complaint that reads
-        like a network problem and is not one:
-
-          * a language YouTube advertises only as a machine translation, under
-            the default source, asked yt-dlp for author-written tracks alone;
-          * a video with no author-written captions at all, where the fallback
-            in _subtitle_language_options picked the automatic codes while the
-            flags still forbade reading them.
-
-        Both were reported live on one video advertising 157 tracks.  A
-        language present in both sets keeps the human track, which is the whole
-        point of the preference, and a deliberate choice of the auto-generated
-        or all-tracks source is honoured for a hand-picked language - only the
-        *preference* is resolved from what is advertised.
-        """
-
-        source = request.subtitle_source
-        if source is SubtitleSource.AUTOMATIC:
-            return False, True
-        if source is SubtitleSource.ALL:
-            return True, True
-        author = {track.language_code for track in request.info.manual_subtitle_tracks}
-        generated = {track.language_code for track in request.info.automatic_subtitle_tracks}
-        wanted_author = [language for language in languages if language in author]
-        wanted_generated = [language for language in languages if language in generated]
-        if wanted_author or not wanted_generated:
-            return True, False
-        return False, True
+        _ = (request, languages)
+        return True, False
 
     def _folder_snapshot(self, output_dir: Path) -> frozenset[str]:
         """Names present in the output folder, for spotting what a run just wrote."""
@@ -1009,8 +1048,8 @@ class Engine:
     ) -> tuple[Path, ...]:
         """Caption files that appeared while this run was in progress.
 
-        Used to rescue a run that YouTube cut short, so a part-finished batch of
-        languages is reported instead of thrown away.
+        Used to rescue a run that a site/service cut short, so a part-finished
+        batch of languages is reported instead of thrown away.
 
         This is a before-and-after diff rather than a search by name.  Matching
         on the filename used to mean repeating the output template's rules here,
@@ -1053,17 +1092,13 @@ class Engine:
         languages = self._subtitle_language_options(request, request.info)
         if not languages:
             raise DownloadFailure(
-                "YouTube did not advertise any caption tracks for this video.",
+                "No author-provided captions are available for this media.",
                 code="subtitles_missing",
             )
         ffmpeg = self._ffmpeg_path or require_ffmpeg(self._app_root)
         relay = _ProgressRelay(progress, cancel_check)
         relay.emit("starting", 0.0, "Preparing subtitle download", force=True)
-        self._logger.info(
-            "download_started mode=subtitles languages=%d automatic=%s",
-            len(languages),
-            request.subtitle_source is not SubtitleSource.PREFERRED,
-        )
+        self._logger.info("download_started mode=subtitles languages=%d manual_only=true", len(languages))
         options = self._base_options(request.output_dir, relay, ffmpeg=ffmpeg)
         writesubtitles, writeautomaticsub = self._subtitle_write_targets(request, languages)
         options.update(
@@ -1074,9 +1109,7 @@ class Engine:
                 "writeautomaticsub": writeautomaticsub,
                 "subtitlesformat": request.subtitle_format.value,
                 "subtitleslangs": languages,
-                # YouTube's caption endpoint starts answering HTTP 429 when a
-                # long run arrives faster than it expects, so a multi-language
-                # request is paced.  A single language needs no delay.
+                # Pace larger caption runs to reduce service throttling.
                 "sleep_interval_subtitles": CAPTION_REQUEST_INTERVAL if len(languages) > 2 else 0,
                 "postprocessors": [],
             }
@@ -1090,10 +1123,8 @@ class Engine:
         except CancelledError:
             raise
         except DownloadFailure as error:
-            # A multi-language run can be cut short when YouTube starts refusing
-            # caption requests.  The files already written are still what the
-            # person asked for, so they are reported with a note about the cap
-            # instead of being presented as a total failure.
+            # A multi-language run can be cut short if the service starts
+            # refusing caption requests. Files already written are still reported.
             written = self._caption_files_written_since(
                 request, request.subtitle_format.extension, already_there
             )
@@ -1107,7 +1138,7 @@ class Engine:
             relay.emit(
                 "completed",
                 100.0,
-                f"Saved {len(written)} caption files before YouTube stopped serving more",
+                f"Saved {len(written)} caption files before more requests were refused",
                 force=True,
             )
             return DownloadResult(
@@ -1115,7 +1146,7 @@ class Engine:
                 mode=request.mode,
                 subtitle_paths=written,
                 warning=(
-                    f"YouTube stopped responding partway through, so {len(written)} of "
+                    f"The site stopped serving more captions partway through, so {len(written)} of "
                     f"{len(languages)} caption files were saved."
                 ),
             )
@@ -1157,7 +1188,7 @@ class Engine:
                 relay.emit(
                     "waiting",
                     None,
-                    f"YouTube asked us to slow down - waiting {int(wait)}s before trying "
+                    f"The site asked us to slow down - waiting {int(wait)}s before trying "
                     f"again (attempt {attempt + 1} of {len(CAPTION_RATE_LIMIT_WAITS) + 1})",
                     force=True,
                 )
@@ -1230,7 +1261,7 @@ class Engine:
                 relay.emit(
                     "waiting",
                     None,
-                    f"YouTube asked us to slow down - waiting {int(wait)}s before trying "
+                    f"The site asked us to slow down - waiting {int(wait)}s before trying "
                     f"again (attempt {attempt + 1} of {len(MEDIA_RATE_LIMIT_WAITS) + 1})",
                     force=True,
                 )
@@ -1248,17 +1279,17 @@ class Engine:
         relay: _ProgressRelay,
     ) -> PlaylistInfo:
         if not isinstance(raw_info, dict) or raw_info.get("_type") not in {"playlist", "multi_video"}:
-            raise UnsupportedContentError("Playlist mode requires a YouTube playlist link.")
+            raise UnsupportedContentError("This link does not appear to be a supported playlist or collection.")
         raw_entries = raw_info.get("entries")
         if raw_entries is None or isinstance(raw_entries, (str, bytes)):
-            raise ExtractionError("YouTube returned no playlist entries.", code="empty_playlist")
+            raise ExtractionError("The site returned no playlist entries.", code="empty_playlist")
         try:
             entries = list(raw_entries)
         except TypeError as error:
-            raise ExtractionError("YouTube returned no playlist entries.", code="empty_playlist") from error
+            raise ExtractionError("The site returned unreadable playlist entries.", code="empty_playlist") from error
         relay.check_cancelled()
         if not entries:
-            raise ExtractionError("YouTube returned an empty playlist.", code="empty_playlist")
+            raise ExtractionError("The playlist or collection is empty.", code="empty_playlist")
 
         videos: list[VideoInfo] = []
         skipped_count = 0
@@ -1292,7 +1323,7 @@ class Engine:
         qualities = self._build_playlist_qualities(
             [video for video in videos if video.selectable]
         )
-        title = " ".join(str(raw_info.get("title") or "YouTube playlist").split())
+        title = " ".join(str(raw_info.get("title") or "Playlist").split())
         playlist_id = str(raw_info.get("id") or "").strip()
         if not playlist_id:
             playlist_id = parse_qs(urlsplit(normalized_url).query).get("list", ["playlist"])[0].strip() or "playlist"
@@ -1408,15 +1439,10 @@ class Engine:
             if not value:
                 continue
             try:
-                return cls._strip_playlist_context(normalize_youtube_url(str(value)))
+                return cls._strip_playlist_context(normalize_media_url(str(value)))
             except UrlValidationError:
                 continue
-        video_id = str(entry.get("id") or "").strip()
-        if video_id:
-            try:
-                return normalize_youtube_url(f"https://www.youtube.com/watch?v={video_id}")
-            except UrlValidationError:
-                return None
+        # Without a concrete URL we cannot safely probe this entry on non-YouTube sites.
         return None
 
     @classmethod
@@ -1470,6 +1496,30 @@ class Engine:
             return None
         return number if number >= 0 else None
 
+    @staticmethod
+    def _infer_height_from_format(fmt: dict[str, Any]) -> int | None:
+        height = Engine._as_float(fmt.get("height"))
+        if height and height > 0:
+            return int(round(height))
+        for key in ("format_note", "format", "resolution", "format_id"):
+            value = str(fmt.get(key) or "").lower()
+            if not value:
+                continue
+            match = re.search(r"(\d{3,4})\s*[pP]", value)
+            if match:
+                parsed = int(match.group(1))
+                if 144 <= parsed <= 4320:
+                    return parsed
+            if re.search(r"\b(2160|1440|1080|720|480|360|240|144)\b", value):
+                match = re.search(r"\b(2160|1440|1080|720|480|360|240|144)\b", value)
+                if match:
+                    return int(match.group(1))
+        fid = str(fmt.get("format_id") or "").strip().lower()
+        mapped = {"sd": 480, "hd": 720, "fullhd": 1080, "uhd": 2160, "4k": 2160}
+        if fid in mapped:
+            return mapped[fid]
+        return None
+
     @classmethod
     def _build_qualities(
         cls,
@@ -1486,12 +1536,23 @@ class Engine:
             if not isinstance(fmt, dict):
                 continue
             format_id = str(fmt.get("format_id") or "").strip()
+            if not format_id:
+                continue
             vcodec = str(fmt.get("vcodec") or "none").lower()
-            if not format_id or vcodec in {"none", ""}:
+            acodec = str(fmt.get("acodec") or "none").lower()
+            if vcodec in {"none", ""} and acodec not in {"none", ""}:
                 continue
-            height = cls._as_float(fmt.get("height"))
+            height = cls._infer_height_from_format(fmt)
             if not height:
-                continue
+                # Generic/progressive labels (e.g. Facebook sd/hd) may lack metadata;
+                # keep them selectable using coarse inferred quality buckets.
+                fid = format_id.lower()
+                if fid in {"sd", "hd"} and fmt.get("url"):
+                    height = 480 if fid == "sd" else 720
+                elif vcodec in {"none", ""} and not fmt.get("url"):
+                    continue
+                else:
+                    continue
             fps = cls._format_fps(fmt)
             key = (int(round(height)), round(fps or 0.0, 3))
             grouped.setdefault(key, []).append((index, fmt))
@@ -1543,6 +1604,36 @@ class Engine:
             result.append(quality)
         return sorted(result, key=lambda item: item.sort_key, reverse=True)
 
+    @staticmethod
+    def _is_probably_watermarked_format(fmt: dict[str, Any]) -> bool:
+        haystack = " ".join(
+            str(fmt.get(key) or "")
+            for key in ("format_id", "format", "format_note", "url", "display_id")
+        ).lower()
+        if not haystack:
+            return False
+        clean_markers = ("no_watermark", "no-watermark", "nowatermark", "nowm", "without watermark", "without_watermark")
+        if any(marker in haystack for marker in clean_markers):
+            return False
+        watermark_markers = ("watermark", "watermarked")
+        return any(marker in haystack for marker in watermark_markers)
+
+    @staticmethod
+    def _prefers_clean_format(fmt: dict[str, Any]) -> int:
+        haystack = " ".join(
+            str(fmt.get(key) or "")
+            for key in ("format_id", "format", "format_note", "url", "display_id")
+        ).lower()
+        if not haystack:
+            return 0
+        clean_markers = ("no_watermark", "no-watermark", "nowatermark", "nowm", "without watermark", "without_watermark")
+        if any(marker in haystack for marker in clean_markers):
+            return 1
+        watermark_markers = ("watermark", "watermarked")
+        if any(marker in haystack for marker in watermark_markers):
+            return -1
+        return 0
+
     @classmethod
     def _best_quality_candidate(
         cls,
@@ -1551,7 +1642,7 @@ class Engine:
         duration: float | None,
         best_audio_size: int | None,
     ) -> VideoQuality | None:
-        best: tuple[tuple[float, float, int, int, int], VideoQuality] | None = None
+        best: tuple[tuple[float, float, int, int, int, int], VideoQuality] | None = None
         for index, fmt in candidates:
             quality = cls._quality_from_format(fmt, index, duration, best_audio_size)
             if quality is None:
@@ -1560,7 +1651,8 @@ class Engine:
             bitrate_score = cls._as_float(fmt.get("tbr") or fmt.get("vbr")) or 0.0
             size_score = int(cls._as_float(fmt.get("filesize") or fmt.get("filesize_approx")) or 0)
             has_audio = 1 if quality.has_audio else 0
-            score = (quality_score, bitrate_score, size_score, has_audio, -index)
+            clean_score = cls._prefers_clean_format(fmt)
+            score = (quality_score, bitrate_score, size_score, has_audio, clean_score, -index)
             if best is None or score > best[0]:
                 best = (score, quality)
         return best[1] if best else None
@@ -1666,27 +1758,37 @@ class Engine:
         best_audio_size: int | None,
     ) -> VideoQuality | None:
         format_id = str(fmt.get("format_id") or "").strip()
-        vcodec = str(fmt.get("vcodec") or "none").lower()
-        if not format_id or vcodec in {"none", ""}:
+        if not format_id:
             return None
-        height = cls._as_float(fmt.get("height"))
+        vcodec = str(fmt.get("vcodec") or "none").lower()
+        acodec = str(fmt.get("acodec") or "none").lower()
+        has_audio = acodec not in {"none", ""}
+        # Accept video formats and generic progressive formats (e.g. sd/hd) where
+        # codec metadata may be missing but a direct URL is available.
+        if vcodec in {"none", ""} and not (fmt.get("url") and str(format_id).lower() in {"sd", "hd"}):
+            return None
+        height = cls._infer_height_from_format(fmt)
+        if not height and str(format_id).lower() in {"sd", "hd"} and fmt.get("url"):
+            height = 480 if str(format_id).lower() == "sd" else 720
         if not height:
             return None
         fps = cls._format_fps(fmt)
-        has_audio = str(fmt.get("acodec") or "none").lower() != "none"
         video_size = cls._estimate_format_size(fmt, duration)
         estimated_size = video_size
         if not has_audio:
-            estimated_size = (
-                video_size + best_audio_size
-                if video_size is not None and best_audio_size is not None
-                else None
-            )
+            if video_size is not None and best_audio_size is not None:
+                estimated_size = video_size + best_audio_size
+            elif video_size is not None:
+                # Better to show a video-stream estimate than nothing when merged
+                # audio size is unknown.
+                estimated_size = video_size
+            else:
+                estimated_size = None
         return VideoQuality(
             format_id=format_id,
             height=int(round(height)),
             fps=fps,
-            has_audio=has_audio,
+            has_audio=has_audio or str(format_id).lower() in {"sd", "hd"},
             width=int(cls._as_float(fmt.get("width")) or 0) or None,
             extension=str(fmt.get("ext") or "") or None,
             estimated_size_bytes=estimated_size,
@@ -1758,7 +1860,7 @@ class Engine:
     def _safe_stem(title: str, video_id: str) -> str:
         safe_title = re.sub(r"[<>:\"/\\|?*\x00-\x1f]", "_", title).strip(" .")
         safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", str(video_id)).strip(" .")
-        stem = safe_title or f"youtube-video-{safe_id or 'unknown'}"
+        stem = safe_title or f"media-{safe_id or 'unknown'}"
         stem = stem[:150].rstrip(" .")
         reserved = {"CON", "PRN", "AUX", "NUL", "CLOCK$"}
         reserved.update(f"COM{index}" for index in range(1, 10))
@@ -1779,9 +1881,18 @@ class Engine:
 
     def _video_format_selector(self, quality: VideoQuality, preference: StreamPreference) -> str:
         format_id = quality.for_preference(preference)
+        fid = str(format_id).lower()
+        # Generic progressive formats (e.g. Facebook sd/hd) should be used directly.
+        if fid in {"sd", "hd"}:
+            return format_id
         if quality.has_audio:
             return format_id
-        return f"{format_id}+bestaudio[ext=m4a]/{format_id}+bestaudio"
+        return (
+            f"{format_id}+bestaudio[ext=m4a]/"
+            f"{format_id}+bestaudio[ext=mp4]/"
+            f"{format_id}+bestaudio/"
+            f"{format_id}"
+        )
 
     def _output_paths_from_result(self, result: dict[str, Any], extension: str) -> list[Path]:
         """Every produced file with the requested extension, in a stable order.
@@ -1888,7 +1999,7 @@ class Engine:
         extra_postprocessors: tuple[Any, ...] = (),
     ) -> DownloadResult:
         try:
-            download_url = normalize_youtube_url(request.url)
+            download_url = normalize_media_url(request.url)
         except UrlValidationError as error:
             raise ExtractionError(str(error), code="invalid_url") from error
         output_dir = self._prepare_output_dir(request.output_dir)
@@ -1975,8 +2086,6 @@ class Engine:
     ) -> DownloadResult:
         if request.quality is None:
             raise DownloadFailure("Select a video quality before downloading.", code="quality_missing")
-        if not request.info.audio_available:
-            raise DownloadFailure("This video has no downloadable audio track, so a complete MP4 cannot be created.", code="audio_missing")
         ffmpeg = self._ffmpeg_path or require_ffmpeg(self._app_root)
         relay = _ProgressRelay(progress, cancel_check)
         relay.emit("starting", 0.0, "Preparing video download", force=True)
@@ -1986,9 +2095,10 @@ class Engine:
             request.preference.value,
         )
         options = self._base_options(request.output_dir, relay, ffmpeg=ffmpeg)
+        format_selector = self._video_format_selector(request.quality, request.preference)
         options.update(
             {
-                "format": self._video_format_selector(request.quality, request.preference),
+                "format": format_selector,
                 "merge_output_format": "mp4",
                 "postprocessors": [{"key": "FFmpegVideoConvertor", "preferedformat": "mp4"}],
                 "postprocessor_args": {
@@ -2070,7 +2180,7 @@ class Engine:
     ) -> DownloadResult:
         relay = _ProgressRelay(progress, cancel_check)
         if not request.info.thumbnail_url:
-            raise ExtractionError("YouTube did not provide a thumbnail for this video.", code="thumbnail_missing")
+            raise ExtractionError("No thumbnail is available for this media.", code="thumbnail_missing")
         relay.emit("starting", 0.0, "Preparing thumbnail download", force=True)
         self._logger.info("download_started mode=thumbnail")
         # A thumbnail is the one download the engine fetches itself, so it is also
@@ -2097,7 +2207,7 @@ class Engine:
                 relay.emit(
                     "waiting",
                     None,
-                    f"YouTube asked us to slow down - waiting {int(wait)}s before trying "
+                    f"The site asked us to slow down - waiting {int(wait)}s before trying "
                     f"again (attempt {attempt + 1} of {len(THUMBNAIL_RATE_LIMIT_WAITS) + 1})",
                     force=True,
                 )
@@ -2184,11 +2294,21 @@ class Engine:
 
     @staticmethod
     def _looks_like_image_bytes(data: bytes) -> bool:
-        return (
-            data.startswith(b"\xff\xd8\xff")
-            or data.startswith(b"\x89PNG\r\n\x1a\n")
-            or (len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP")
-        )
+        if len(data) < 2:
+            return False
+        if data.startswith(b"\xff\xd8\xff"):
+            return True
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return True
+        if data.startswith(b"GIF87a") or data.startswith(b"GIF89a"):
+            return True
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return True
+        if data.startswith(b"BM"):
+            return True
+        if len(data) >= 12 and data[4:8] == b"ftyp":
+            return True  # AVIF/HEIF containers
+        return False
 
     @staticmethod
     def _thumbnail_extension(content_type: str, url: str) -> str:
@@ -2224,7 +2344,7 @@ class Engine:
         """
 
         try:
-            normalize_youtube_playlist_url(request.url)
+            normalize_playlist_url(request.url)
         except UrlValidationError as error:
             raise ExtractionError(str(error), code="invalid_url") from error
 
@@ -2285,7 +2405,7 @@ class Engine:
 
             if media is PlaylistMedia.SUBTITLES and not video.subtitles_available:
                 failures.append(
-                    (video.title, "YouTube did not advertise any caption tracks for this video.")
+                    (video.title, "No author-provided captions are available for this media.")
                 )
                 failed_ids.append(video.video_id)
                 relay.emit(
@@ -2310,19 +2430,14 @@ class Engine:
                 )
                 continue
 
-            video_url = video.normalized_url.strip()
-            if not video_url and video.video_id:
-                try:
-                    video_url = normalize_youtube_url(f"https://www.youtube.com/watch?v={video.video_id}")
-                except UrlValidationError:
-                    video_url = ""
+            video_url = (video.normalized_url or "").strip()
             if not video_url:
-                failures.append((video.title, "The playlist entry did not contain a valid video URL."))
+                failures.append((video.title, "The playlist entry did not contain a valid media URL."))
                 failed_ids.append(video.video_id)
                 relay.emit(
                     "playlist",
                     (index + 1) / total * 100.0,
-                    f"{item_noun.capitalize()} {index + 1} of {total}: skipped (missing video URL)",
+                    f"{item_noun.capitalize()} {index + 1} of {total}: skipped (missing URL)",
                 )
                 continue
 
@@ -2693,7 +2808,7 @@ class Engine:
                 code="mode_invalid",
             )
         try:
-            normalize_youtube_url(request.url)
+            normalize_media_url(request.url)
         except UrlValidationError as error:
             raise ExtractionError(str(error), code="invalid_url") from error
         if request.mode is DownloadMode.VIDEO:

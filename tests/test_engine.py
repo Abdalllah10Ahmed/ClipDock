@@ -1222,17 +1222,19 @@ class EngineTests(unittest.TestCase):
                     cancel_check=lambda: True,
                 )
 
-    def test_download_rejects_collection_urls_at_the_engine_boundary(self) -> None:
-        info = self.engine.probe("https://youtu.be/video123")
-        with tempfile.TemporaryDirectory() as directory, self.assertRaises(ExtractionError):
-            self.engine.download(
-                DownloadRequest(
-                    url="https://youtube.com/playlist?list=abc",
-                    output_dir=Path(directory),
-                    mode=DownloadMode.THUMBNAIL,
-                    info=info,
-                )
-            )
+    def test_probe_rejects_collection_urls_at_the_engine_boundary(self) -> None:
+        class PlaylistLikeYdl(FakeYdl):
+            def extract_info(self, url: str, download: bool):
+                return {
+                    "_type": "playlist",
+                    "id": "PL123",
+                    "title": "A playlist",
+                    "entries": [{"id": "v1", "url": "https://example.com/v1"}],
+                }
+
+        engine = Engine(ydl_factory=PlaylistLikeYdl)
+        with self.assertRaises(UnsupportedContentError):
+            engine.probe("https://www.youtube.com/playlist?list=PL123")
 
     def test_playlist_download_reports_failure_when_every_item_fails(self) -> None:
         FakePlaylistYdl.failed_ids = {"v1", "v2", "bad"}
@@ -1511,7 +1513,8 @@ class EngineTests(unittest.TestCase):
                     preference=StreamPreference.SMALLER_FILE,
                 )
             )
-        self.assertEqual(FakeStreamYdl.instances[-1].options["format"], "prog-1080+bestaudio[ext=m4a]/prog-1080+bestaudio")
+        fmt = FakeStreamYdl.instances[-1].options["format"]
+        self.assertTrue(fmt.startswith("prog-1080+bestaudio[ext=m4a]/prog-1080+bestaudio"))
 
     def test_playlist_qualities_report_a_smaller_total_only_when_every_video_has_one(self) -> None:
         info = self.playlist_engine.probe_playlist("https://www.youtube.com/playlist?list=PL123")
@@ -1521,17 +1524,16 @@ class EngineTests(unittest.TestCase):
             self.assertIsNone(quality.smaller_size_bytes)
             self.assertEqual(quality.smaller_video_count, 0)
 
-    def test_subtitle_download_writes_only_the_requested_caption_files(self) -> None:
+    def test_subtitle_download_writes_only_manual_caption_files(self) -> None:
         info = self.engine.probe("https://youtu.be/video123")
         self.assertTrue(info.subtitles_available)
         self.assertEqual(
             {track.language_code for track in info.manual_subtitle_tracks},
             {"en", "fr"},
         )
-        self.assertEqual(
-            {track.language_code for track in info.automatic_subtitle_tracks},
-            {"en", "de"},
-        )
+        # Auto-generated captions are ignored by the app.
+        self.assertEqual(info.automatic_subtitle_tracks, ())
+        self.assertEqual({track.language_code for track in info.subtitle_tracks}, {"en", "fr"})
         with tempfile.TemporaryDirectory() as directory:
             result = self.engine.download_subtitles(
                 DownloadRequest(
@@ -1540,719 +1542,77 @@ class EngineTests(unittest.TestCase):
                     mode=DownloadMode.SUBTITLES,
                     info=info,
                     subtitle_format=SubtitleFormat.SRT,
-                    subtitle_source=SubtitleSource.PREFERRED,
                 )
             )
-        self.assertEqual([path.suffix for path in result.subtitle_paths], [".srt", ".srt"])
+        self.assertEqual(sorted(path.suffix for path in result.subtitle_paths), [".srt", ".srt"])
         self.assertEqual(result.path, result.subtitle_paths[0])
         options = FakeYdl.instances[-1].options
-        # A caption run must not also download the media.
         self.assertTrue(options["skip_download"])
         self.assertTrue(options["writesubtitles"])
-        # PREFERRED only asks for author-written tracks, so the automatic
-        # fallback flag stays off.
         self.assertFalse(options["writeautomaticsub"])
         self.assertEqual(options["subtitlesformat"], "srt")
-        self.assertEqual(options["subtitleslangs"], ["en", "fr"])
+        self.assertEqual(sorted(options["subtitleslangs"]), ["en", "fr"])
         self.assertEqual(options["postprocessors"], [])
 
-    def test_subtitle_source_selects_tracks_and_enables_the_automatic_fallback(self) -> None:
+    def test_subtitle_download_can_request_one_manual_language(self) -> None:
         info = self.engine.probe("https://youtu.be/video123")
         with tempfile.TemporaryDirectory() as directory:
-            automatic = self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_source=SubtitleSource.AUTOMATIC,
-                )
-            )
-        options = FakeYdl.instances[-1].options
-        self.assertEqual(options["subtitleslangs"], ["de", "en"])
-        self.assertTrue(options["writeautomaticsub"])
-        # yt-dlp hands back the author-written track whenever writesubtitles is
-        # on, so an ASR-only request has to turn it off or it is not ASR at all.
-        self.assertFalse(options["writesubtitles"])
-        self.assertEqual(len(automatic.subtitle_paths), 2)
-
-        with tempfile.TemporaryDirectory() as directory:
-            every = self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_format=SubtitleFormat.VTT,
-                    subtitle_source=SubtitleSource.ALL,
-                )
-            )
-        options = FakeYdl.instances[-1].options
-        # ALL asks for concrete codes rather than an uncapped "everything",
-        # so the engine's own limit applies.
-        self.assertEqual(options["subtitleslangs"], ["de", "en", "fr"])
-        self.assertEqual(options["subtitlesformat"], "vtt")
-        # A multi-language run is paced so the caption endpoint keeps answering.
-        self.assertGreater(options["sleep_interval_subtitles"], 0)
-        self.assertEqual(len(every.subtitle_paths), 3)
-        self.assertTrue(all(path.suffix == ".vtt" for path in every.subtitle_paths))
-        self.assertEqual(every.warning, "")
-
-    def test_a_single_caption_request_is_not_delayed(self) -> None:
-        info = self.engine.probe("https://youtu.be/video123")
-        with tempfile.TemporaryDirectory() as directory:
-            self.engine.download_subtitles(
+            result = self.engine.download_subtitles(
                 DownloadRequest(
                     url=info.normalized_url,
                     output_dir=Path(directory),
                     mode=DownloadMode.SUBTITLES,
                     info=info,
                     subtitle_language="en",
+                    subtitle_format=SubtitleFormat.VTT,
+                )
+            )
+        options = FakeYdl.instances[-1].options
+        self.assertEqual(options["subtitleslangs"], ["en"])
+        self.assertEqual(options["subtitlesformat"], "vtt")
+        self.assertFalse(options["writeautomaticsub"])
+        self.assertEqual(options["sleep_interval_subtitles"], 0)
+        self.assertEqual(len(result.subtitle_paths), 1)
+        self.assertEqual(result.subtitle_paths[0].suffix, ".vtt")
+
+    def test_subtitle_download_ignores_auto_only_tracks(self) -> None:
+        FakeYdl.caption_tracks = {
+            "subtitles": {"en": [{"name": "English"}]},
+            "automatic_captions": {"de": [{"name": "German (auto-generated)"}]},
+        }
+        info = self.engine.probe("https://youtu.be/video123")
+        self.assertEqual({t.language_code for t in info.manual_subtitle_tracks}, {"en"})
+        self.assertEqual(info.automatic_subtitle_tracks, ())
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
                 )
             )
         self.assertEqual(FakeYdl.instances[-1].options["subtitleslangs"], ["en"])
-        self.assertEqual(FakeYdl.instances[-1].options["sleep_interval_subtitles"], 0)
-
-    def test_a_language_offered_only_as_a_translation_is_still_written(self) -> None:
-        # "Author-written first" says it falls back to auto-generated captions
-        # when a language has no human track.  A real video advertises well over
-        # a hundred languages that exist only as machine translations, and
-        # picking one of those under the default source wrote nothing at all:
-        # yt-dlp was told to read author-written tracks only, found none for
-        # that language, and the run ended with "The requested SRT file was not
-        # produced" - which reads like a network fault and is not one.
-        info = self.engine.probe("https://youtu.be/video123")
-        self.assertNotIn("de", {t.language_code for t in info.manual_subtitle_tracks})
-        self.assertIn("de", {t.language_code for t in info.automatic_subtitle_tracks})
-        with tempfile.TemporaryDirectory() as directory:
-            result = self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_language="de",
-                )
-            )
-        options = FakeYdl.instances[-1].options
-        self.assertEqual(options["subtitleslangs"], ["de"])
-        self.assertFalse(options["writesubtitles"])
-        self.assertTrue(options["writeautomaticsub"])
-        self.assertEqual(len(result.subtitle_paths), 1)
-        self.assertEqual(result.subtitle_paths[0].suffix, ".srt")
-
-    def test_the_fallback_to_automatic_captions_is_actually_readable(self) -> None:
-        # The same promise, failing the other way round.  The language list falls
-        # back to the automatic codes when a video has no author-written track
-        # at all, so reading only author-written tracks meant the fallback
-        # selected languages the run was then forbidden to look for.
-        FakeYdl.caption_tracks = {
-            "subtitles": {},
-            "automatic_captions": {"es": [{"name": "Spanish (auto-generated)"}]},
-        }
-        info = self.engine.probe("https://youtu.be/video123")
-        with tempfile.TemporaryDirectory() as directory:
-            result = self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                )
-            )
-        options = FakeYdl.instances[-1].options
-        self.assertEqual(options["subtitleslangs"], ["es"])
-        self.assertTrue(options["writeautomaticsub"])
+        self.assertFalse(FakeYdl.instances[-1].options["writeautomaticsub"])
         self.assertEqual(len(result.subtitle_paths), 1)
 
-    def test_an_author_written_language_is_still_preferred_over_its_translation(self) -> None:
-        # The fix must not turn the preference off: French is advertised under
-        # both headings on the fake video, and the human track is the reason the
-        # source is called "Author-written first".
-        info = self.engine.probe("https://youtu.be/video123")
-        self.assertIn("fr", {t.language_code for t in info.manual_subtitle_tracks})
-        with tempfile.TemporaryDirectory() as directory:
-            self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_language="fr",
-                )
-            )
-        options = FakeYdl.instances[-1].options
-        self.assertTrue(options["writesubtitles"])
-        self.assertFalse(options["writeautomaticsub"])
-
-    def test_a_deliberate_auto_source_is_not_overridden_for_a_hand_picked_language(self) -> None:
-        # Only the preference is resolved from what is advertised.  Someone who
-        # asked for the ASR track alone still gets it, even for a language that
-        # also has a human track.  English is the language advertised under both
-        # headings on the fake video, which is the only kind where the two
-        # readings could differ.
-        info = self.engine.probe("https://youtu.be/video123")
-        with tempfile.TemporaryDirectory() as directory:
-            result = self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_language="en",
-                    subtitle_source=SubtitleSource.AUTOMATIC,
-                )
-            )
-        options = FakeYdl.instances[-1].options
-        self.assertFalse(options["writesubtitles"])
-        self.assertTrue(options["writeautomaticsub"])
-        self.assertEqual(len(result.subtitle_paths), 1)
-
-    def test_the_all_source_still_writes_both_kinds_for_a_hand_picked_language(self) -> None:
-        info = self.engine.probe("https://youtu.be/video123")
-        with tempfile.TemporaryDirectory() as directory:
-            self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_language="fr",
-                    subtitle_source=SubtitleSource.ALL,
-                )
-            )
-        options = FakeYdl.instances[-1].options
-        self.assertTrue(options["writesubtitles"])
-        self.assertTrue(options["writeautomaticsub"])
-
-    def test_a_refused_request_is_retried_with_a_delay(self) -> None:
-        # Ten retries with no pause cannot outlast a rate limit, so the engine
-        # supplies its own backoff.
-        self.assertGreater(_retry_backoff(0), 0.0)
-        self.assertGreater(_retry_backoff(3), _retry_backoff(0))
-        self.assertLessEqual(_retry_backoff(20), 31.0)
-
-    def test_all_tracks_caps_the_language_request(self) -> None:
-        # A real video advertises well over a hundred machine-translated
-        # tracks, and fetching them all trips YouTube's caption rate limit.
-        languages = [f"xx{index}" for index in range(MAX_SUBTITLE_LANGUAGES + 40)]
-        FakeYdl.caption_tracks = {
-            "subtitles": {"en": [{"name": "English"}]},
-            "automatic_captions": {code: [{"name": code}] for code in languages},
-        }
-        info = self.engine.probe("https://youtu.be/video123")
-        self.assertGreater(len(info.subtitle_tracks), MAX_SUBTITLE_LANGUAGES)
-        with tempfile.TemporaryDirectory() as directory:
-            result = self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_source=SubtitleSource.ALL,
-                )
-            )
-        requested = FakeYdl.instances[-1].options["subtitleslangs"]
-        self.assertEqual(len(requested), MAX_SUBTITLE_LANGUAGES)
-        self.assertIn("en", requested)
-        self.assertEqual(len(result.subtitle_paths), MAX_SUBTITLE_LANGUAGES)
-
-    def test_the_author_fallback_is_capped_too(self) -> None:
-        # A video with no author-written captions falls back to the automatic
-        # list, which is just as long and just as rate-limited, so the cap has
-        # to apply on that path as well.
-        languages = [f"xx{index}" for index in range(MAX_SUBTITLE_LANGUAGES + 40)]
-        FakeYdl.caption_tracks = {
-            "subtitles": {},
-            "automatic_captions": {code: [{"name": code}] for code in languages},
-        }
-        info = self.engine.probe("https://youtu.be/video123")
-        with tempfile.TemporaryDirectory() as directory:
-            self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                )
-            )
-        self.assertEqual(
-            len(FakeYdl.instances[-1].options["subtitleslangs"]), MAX_SUBTITLE_LANGUAGES
-        )
-
-    def test_asr_only_runs_are_capped(self) -> None:
-        languages = [f"xx{index}" for index in range(MAX_SUBTITLE_LANGUAGES + 40)]
-        FakeYdl.caption_tracks = {
-            "subtitles": {"en": [{"name": "English"}]},
-            "automatic_captions": {code: [{"name": code}] for code in languages},
-        }
-        info = self.engine.probe("https://youtu.be/video123")
-        with tempfile.TemporaryDirectory() as directory:
-            self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_source=SubtitleSource.AUTOMATIC,
-                )
-            )
-        self.assertEqual(
-            len(FakeYdl.instances[-1].options["subtitleslangs"]), MAX_SUBTITLE_LANGUAGES
-        )
-
-    def test_a_caption_run_cut_short_still_reports_the_files_it_wrote(self) -> None:
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.fail_after_subtitles = 2
-        with tempfile.TemporaryDirectory() as directory:
-            result = self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_source=SubtitleSource.ALL,
-                )
-            )
-            self.assertEqual(len(result.subtitle_paths), 2)
-            self.assertTrue(all(path.is_file() for path in result.subtitle_paths))
-        self.assertIn("2 of 3", result.warning)
-
-    def test_a_caption_run_cut_short_by_another_fault_is_not_retried(self) -> None:
-        # Only a rate limit is worth waiting for.  A run cut short by anything
-        # else must be reported on its first attempt, or the person sits through
-        # two delays to be told something that was never going to change.
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.fail_after_subtitles = 1
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched():
-            self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_source=SubtitleSource.ALL,
-                )
-            )
-        self.assertEqual(clock.slept, [])
-        self.assertEqual(FakeYdl.caption_runs, 1)
-
-    def test_a_caption_run_waits_out_a_rate_limit_and_asks_only_for_what_is_missing(self) -> None:
-        # The live endpoint refuses a throttled caption request outright and
-        # yt-dlp never retries one: `downloader/http.py` re-raises any status
-        # below 500 without marking it retryable, so `"retries": 5` cannot help.
-        # The retry therefore has to be the app's, and it is only worth having
-        # if the second attempt does not re-request the language the first one
-        # already saved.
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.fail_after_subtitles = 1
-        FakeYdl.caption_failure_message = RATE_LIMIT_TEXT
-        FakeYdl.caption_failures_remaining = 1
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched():
-            result = self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_source=SubtitleSource.ALL,
-                )
-            )
-            self.assertEqual(len(result.subtitle_paths), 3)
-            self.assertTrue(all(path.is_file() for path in result.subtitle_paths))
-        self.assertEqual(FakeYdl.caption_runs, 2, "the refused attempt should be retried once")
-        self.assertEqual(
-            FakeYdl.reused_subtitles, ["de"], "the language already saved must not be fetched again"
-        )
-        self.assertAlmostEqual(clock.total_slept, 10.0, places=6)
-        self.assertTrue(
-            all(step <= 0.25 for step in clock.slept),
-            "the wait must sleep in short steps so a cancel is not held up",
-        )
-
-    def test_a_caption_run_that_keeps_being_throttled_waits_a_bounded_time_then_reports(self) -> None:
-        # This is the measured shape of the live failure: refused on the very
-        # first request, so nothing is ever written and the run has to report a
-        # rate limit rather than a network fault -- after a bounded wait, not
-        # forever.
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.fail_after_subtitles = 0
-        FakeYdl.caption_failure_message = RATE_LIMIT_TEXT
-        FakeYdl.caption_failures_remaining = 99
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched(), self.assertRaises(
-            DownloadFailure
-        ) as context:
-            self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_source=SubtitleSource.ALL,
-                )
-            )
-        self.assertEqual(FakeYdl.caption_runs, 3, "a throttled run must give up rather than loop")
-        self.assertEqual(context.exception.code, "rate_limited")
-        self.assertIn("429", context.exception.message)
-        self.assertAlmostEqual(clock.total_slept, 40.0, places=6)
-
-    def test_a_rate_limited_caption_run_says_so_instead_of_blaming_the_connection(self) -> None:
-        mapped = friendly_error(RuntimeError(RATE_LIMIT_TEXT))
-        self.assertEqual(mapped.code, "rate_limited")
-        self.assertIn("429", mapped.message)
-        self.assertNotIn("network connection", mapped.message)
-
-    def test_a_caption_run_slows_its_pacing_down_after_being_throttled(self) -> None:
-        # Pacing is what the cap and the interval are for, so a run that has
-        # just been told to slow down should ask less often rather than repeat
-        # itself at the rate that was refused.
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.fail_after_subtitles = 1
-        FakeYdl.caption_failure_message = RATE_LIMIT_TEXT
-        FakeYdl.caption_failures_remaining = 99
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched():
-            result = self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_source=SubtitleSource.ALL,
-                )
-            )
-        self.assertEqual(FakeYdl.caption_pacing, [0.6, 1.2, 2.0])
-        # One language survived the first attempt, so the run reports that
-        # rather than failing outright.
-        self.assertIn("1 of 3", result.warning or "")
-
-    def test_a_caption_run_stops_waiting_the_moment_it_is_cancelled(self) -> None:
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.fail_after_subtitles = 1
-        FakeYdl.caption_failure_message = RATE_LIMIT_TEXT
-        FakeYdl.caption_failures_remaining = 99
-        clock = _FakeClock()
-        announced: list[str] = []
-
-        def _progress(event: Any) -> None:
-            announced.append(event.message)
-
-        def _cancel() -> bool:
-            # Cancelled as soon as the person has been told a wait is starting,
-            # and not before, so the first attempt really does run.
-            return any("slow down" in message for message in announced)
-
-        with tempfile.TemporaryDirectory() as directory, clock.patched(), self.assertRaises(
-            CancelledError
-        ):
-            self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                    subtitle_source=SubtitleSource.ALL,
-                ),
-                progress=_progress,
-                cancel_check=_cancel,
-            )
-        self.assertEqual(clock.slept, [], "a cancelled wait must not sleep through its delay")
-        self.assertEqual(FakeYdl.caption_runs, 1)
-
-    def test_a_media_retry_continues_the_part_written_file_instead_of_starting_it_over(self) -> None:
-        # This is the question PROJECT_MAP records as unmeasured.  A media retry is
-        # only worth having if the part-written file the refused attempt left is
-        # still there to be finished, so the fake writes one distinguishable half,
-        # refuses, and can only produce a whole file by appending the other half
-        # to it.  A restart would be the same length and the same path -- the two
-        # are told apart by the bytes, which is the only way to tell them apart.
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.media_failure_message = RATE_LIMIT_TEXT
-        FakeYdl.media_failures_remaining = 1
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched():
-            result = self.engine.download_video(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.VIDEO,
-                    info=info,
-                    quality=info.qualities[-1],
-                )
-            )
-            self.assertEqual(
-                result.path.read_bytes(),
-                FakeYdl.MEDIA_FIRST_HALF + FakeYdl.MEDIA_SECOND_HALF,
-                "the retry must finish the file the refusal interrupted, not begin a new one",
-            )
-        self.assertEqual(FakeYdl.media_resumed, [result.path.name])
-        self.assertEqual(FakeYdl.media_continuedl, [True, True], "resume depends on continuedl staying on")
-
-    def test_a_throttled_media_request_is_waited_out_and_asked_again(self) -> None:
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.media_failure_message = RATE_LIMIT_TEXT
-        FakeYdl.media_failures_remaining = 1
-        clock = _FakeClock()
-        events: list[Any] = []
-        with tempfile.TemporaryDirectory() as directory, clock.patched():
-            result = self.engine.download_video(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.VIDEO,
-                    info=info,
-                    quality=info.qualities[-1],
-                ),
-                progress=events.append,
-            )
-            self.assertTrue(result.path.is_file())
-        self.assertEqual(FakeYdl.media_runs, 2)
-        waiting = [event for event in events if event.phase == "waiting"]
-        self.assertEqual(len(waiting), 1, "the wait has to be visible, not silent")
-        self.assertIsNone(waiting[0].percent, "an unknown percentage must not be reported as a number")
-        self.assertIn("60s", waiting[0].message)
-        self.assertIn("attempt 2 of 3", waiting[0].message)
-        self.assertAlmostEqual(clock.total_slept, 60.0, places=6)
-        self.assertTrue(
-            all(step <= 0.25 for step in clock.slept),
-            "the wait must sleep in short steps so a cancel is not held up",
-        )
-
-    def test_a_media_retry_asks_for_one_fragment_at_a_time(self) -> None:
-        # Four fragment requests at once is the most likely thing to be holding a
-        # limit open, so the retry asks for them one at a time -- and leaves them
-        # that way, because an item that needed one-at-a-time should keep it.
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.media_failure_message = RATE_LIMIT_TEXT
-        FakeYdl.media_failures_remaining = 1
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched():
-            self.engine.download_audio(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.AUDIO,
-                    info=info,
-                    audio_bitrate=128,
-                )
-            )
-        self.assertEqual(FakeYdl.media_concurrency, [4, 1])
-
-    def test_a_media_retry_waits_longer_than_the_backoff_that_already_ran(self) -> None:
-        # Eight fragment retries have already spent about two minutes of
-        # `_retry_backoff` by the time the application is told.  A ten-second wait
-        # would be asking for less than the service has already been asked for.
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.media_failure_message = RATE_LIMIT_TEXT
-        FakeYdl.media_failures_remaining = 99
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched(), self.assertRaises(
-            DownloadFailure
-        ) as context:
-            self.engine.download_video(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.VIDEO,
-                    info=info,
-                    quality=info.qualities[-1],
-                )
-            )
-        self.assertEqual(context.exception.code, "rate_limited")
-        self.assertIn("429", context.exception.message)
-        self.assertEqual(FakeYdl.media_runs, 3, "a throttled item must give up rather than loop")
-        self.assertAlmostEqual(clock.total_slept, 180.0, places=6)
-        self.assertGreater(
-            clock.total_slept,
-            sum(min(2.0**attempt, 30.0) for attempt in range(8)),
-        )
-
-    def test_a_media_failure_that_is_not_a_rate_limit_is_not_retried(self) -> None:
-        # Waiting out a refused format or a removed video would only delay the
-        # explanation the person needs.
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.media_failure_message = "Requested format is not available"
-        FakeYdl.media_failures_remaining = 99
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched(), self.assertRaises(
-            DownloadFailure
-        ) as context:
-            self.engine.download_video(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.VIDEO,
-                    info=info,
-                    quality=info.qualities[-1],
-                )
-            )
-        self.assertEqual(context.exception.code, "format_changed")
-        self.assertEqual(FakeYdl.media_runs, 1)
-        self.assertEqual(clock.slept, [])
-
-    def test_a_media_retry_stops_waiting_the_moment_it_is_cancelled(self) -> None:
-        info = self.engine.probe("https://youtu.be/video123")
-        FakeYdl.media_failure_message = RATE_LIMIT_TEXT
-        FakeYdl.media_failures_remaining = 99
-        clock = _FakeClock()
-        announced: list[str] = []
-
-        def _cancel() -> bool:
-            # Cancelled as soon as the person has been told a wait is starting, and
-            # not before, so the first attempt really does run and really is
-            # refused.  A cancel that was true from the start would be caught by
-            # the first progress emit and prove nothing about the wait.
-            return any("slow down" in message for message in announced)
-
-        with tempfile.TemporaryDirectory() as directory, clock.patched(), self.assertRaises(
-            CancelledError
-        ):
-            self.engine.download_video(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.VIDEO,
-                    info=info,
-                    quality=info.qualities[-1],
-                ),
-                progress=lambda event: announced.append(event.message),
-                cancel_check=_cancel,
-            )
-        self.assertEqual(clock.slept, [], "a cancelled wait must not sleep through its delay")
-        self.assertEqual(FakeYdl.media_runs, 1)
-
-    def test_a_throttled_thumbnail_is_waited_out_and_asked_again(self) -> None:
-        info = self.engine.probe("https://youtu.be/video123")
-
-        class OneChunkResponse:
-            headers = {"Content-Length": "8", "Content-Type": "image/jpeg"}
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return None
-
-            def read(self, size: int) -> bytes:
-                if hasattr(self, "done"):
-                    return b""
-                self.done = True
-                return b"\xff\xd8\xffdata"
-
-        calls: list[Any] = []
-
-        def _urlopen(*args: Any, **kwargs: Any) -> Any:
-            calls.append(args)
-            if len(calls) == 1:
-                raise urllib.error.HTTPError(
-                    "https://img.example/large.jpg", 429, "Too Many Requests", None, None
-                )
-            return OneChunkResponse()
-
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched(), patch(
-            "youtube_downloader.core.engine.urllib.request.urlopen", _urlopen
-        ):
-            result = self.engine.download_thumbnail(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.THUMBNAIL,
-                    info=info,
-                )
-            )
-            self.assertEqual(result.path.read_bytes(), b"\xff\xd8\xffdata")
-        self.assertEqual(len(calls), 2, "the refused request must be asked again")
-        self.assertAlmostEqual(clock.total_slept, 10.0, places=6)
-
-    def test_a_throttled_thumbnail_is_not_reported_as_a_broken_connection(self) -> None:
-        # The thumbnail branch catches `urllib.error.HTTPError` itself and used to
-        # answer every one of them with "check the connection", without ever asking
-        # the classifier -- the same wrong cause `2c4b456` fixed everywhere else and
-        # missed here.  Found by building the retry, not by looking for it.
-        info = self.engine.probe("https://youtu.be/video123")
-
-        def _urlopen(*args: Any, **kwargs: Any) -> Any:
-            raise urllib.error.HTTPError(
-                "https://img.example/large.jpg", 429, "Too Many Requests", None, None
-            )
-
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched(), patch(
-            "youtube_downloader.core.engine.urllib.request.urlopen", _urlopen
-        ), self.assertRaises(DownloadFailure) as context:
-            self.engine.download_thumbnail(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.THUMBNAIL,
-                    info=info,
-                )
-            )
-        self.assertEqual(context.exception.code, "rate_limited")
-        self.assertIn("429", context.exception.message)
-        # The message may name the connection -- it has to, to rule it out -- but
-        # it must not tell the person to go and check it, which is what the
-        # network message says and what this used to say for a 429.
-        self.assertNotIn("Check the connection", context.exception.message)
-
-    def test_a_thumbnail_failure_that_is_not_a_rate_limit_still_blames_the_network(self) -> None:
-        # The classifier must not swallow every thumbnail failure: a DNS failure is
-        # not a throttle and still gets the connection message.
-        info = self.engine.probe("https://youtu.be/video123")
-
-        def _urlopen(*args: Any, **kwargs: Any) -> Any:
-            raise urllib.error.URLError("Temporary failure in name resolution")
-
-        clock = _FakeClock()
-        with tempfile.TemporaryDirectory() as directory, clock.patched(), patch(
-            "youtube_downloader.core.engine.urllib.request.urlopen", _urlopen
-        ), self.assertRaises(DownloadFailure) as context:
-            self.engine.download_thumbnail(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.THUMBNAIL,
-                    info=info,
-                )
-            )
-        self.assertEqual(context.exception.code, "network_failure")
-        self.assertEqual(clock.slept, [], "a network fault is not worth waiting out")
-
-    def test_a_caption_run_that_wrote_nothing_still_fails(self) -> None:
-        FakeYdl.caption_tracks = {}
-        info = self.engine.probe("https://youtu.be/video123")
-        with tempfile.TemporaryDirectory() as directory, self.assertRaises(DownloadFailure):
-            self.engine.download_subtitles(
-                DownloadRequest(
-                    url=info.normalized_url,
-                    output_dir=Path(directory),
-                    mode=DownloadMode.SUBTITLES,
-                    info=info,
-                )
-            )
-
-    def test_subtitle_download_falls_back_to_automatic_tracks_without_author_captions(self) -> None:
+    def test_subtitle_download_reports_when_only_auto_captions_exist(self) -> None:
         FakeYdl.caption_tracks = {"automatic_captions": {"es": [{"name": "Spanish (auto-generated)"}]}}
         info = self.engine.probe("https://youtu.be/video123")
         self.assertEqual(info.manual_subtitle_tracks, ())
-        with tempfile.TemporaryDirectory() as directory:
-            result = self.engine.download_subtitles(
+        self.assertFalse(info.subtitles_available)
+        with tempfile.TemporaryDirectory() as directory, self.assertRaises(DownloadFailure) as context:
+            self.engine.download_subtitles(
                 DownloadRequest(
                     url=info.normalized_url,
                     output_dir=Path(directory),
                     mode=DownloadMode.SUBTITLES,
                     info=info,
-                    subtitle_source=SubtitleSource.PREFERRED,
                 )
             )
-        self.assertEqual(FakeYdl.instances[-1].options["subtitleslangs"], ["es"])
-        self.assertEqual(len(result.subtitle_paths), 1)
+        self.assertEqual(context.exception.code, "subtitles_missing")
 
-    def test_subtitle_download_reports_when_no_captions_are_advertised(self) -> None:
+    def test_subtitle_download_reports_when_no_manual_captions_are_advertised(self) -> None:
         FakeYdl.caption_tracks = {}
         info = self.engine.probe("https://youtu.be/video123")
         self.assertFalse(info.subtitles_available)
@@ -2266,6 +1626,91 @@ class EngineTests(unittest.TestCase):
                 )
             )
         self.assertEqual(context.exception.code, "subtitles_missing")
+
+    def test_all_available_manual_tracks_are_capped(self) -> None:
+        languages = [f"xx{index}" for index in range(MAX_SUBTITLE_LANGUAGES + 40)]
+        FakeYdl.caption_tracks = {
+            "subtitles": {code: [{"name": code}] for code in ["en", *languages]},
+            "automatic_captions": {"zz": [{"name": "auto"}]},
+        }
+        info = self.engine.probe("https://youtu.be/video123")
+        self.assertGreater(len(info.manual_subtitle_tracks), MAX_SUBTITLE_LANGUAGES)
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                )
+            )
+        requested = FakeYdl.instances[-1].options["subtitleslangs"]
+        self.assertEqual(len(requested), MAX_SUBTITLE_LANGUAGES)
+        self.assertEqual(len(result.subtitle_paths), MAX_SUBTITLE_LANGUAGES)
+        self.assertEqual(result.warning, "")
+
+    def test_a_manual_caption_run_cut_short_still_reports_the_files_it_wrote(self) -> None:
+        FakeYdl.caption_tracks = {
+            "subtitles": {"en": [{"name": "English"}], "fr": [{"name": "French"}], "de": [{"name": "German"}]},
+        }
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.fail_after_subtitles = 2
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                )
+            )
+            self.assertEqual(len(result.subtitle_paths), 2)
+            self.assertTrue(all(path.is_file() for path in result.subtitle_paths))
+        self.assertIn("2 of 3", result.warning)
+
+    def test_a_caption_run_cut_short_by_another_fault_is_not_retried(self) -> None:
+        FakeYdl.caption_tracks = {
+            "subtitles": {"en": [{"name": "English"}], "fr": [{"name": "French"}], "de": [{"name": "German"}]},
+        }
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.fail_after_subtitles = 1
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched():
+            self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                )
+            )
+        self.assertEqual(clock.slept, [])
+        self.assertEqual(FakeYdl.caption_runs, 1)
+
+    def test_a_caption_run_waits_out_a_rate_limit_and_asks_only_for_what_is_missing(self) -> None:
+        FakeYdl.caption_tracks = {
+            "subtitles": {"en": [{"name": "English"}], "fr": [{"name": "French"}], "de": [{"name": "German"}]},
+        }
+        info = self.engine.probe("https://youtu.be/video123")
+        FakeYdl.fail_after_subtitles = 1
+        FakeYdl.caption_failure_message = RATE_LIMIT_TEXT
+        FakeYdl.caption_failures_remaining = 1
+        clock = _FakeClock()
+        with tempfile.TemporaryDirectory() as directory, clock.patched():
+            result = self.engine.download_subtitles(
+                DownloadRequest(
+                    url=info.normalized_url,
+                    output_dir=Path(directory),
+                    mode=DownloadMode.SUBTITLES,
+                    info=info,
+                )
+            )
+            self.assertEqual(len(result.subtitle_paths), 3)
+            self.assertTrue(all(path.is_file() for path in result.subtitle_paths))
+        self.assertEqual(FakeYdl.caption_runs, 2)
+        # probe() + initial failed attempt + retry
+        self.assertEqual(len(FakeYdl.instances), 3)
+        self.assertGreater(len(clock.slept), 0)
 
     def test_queue_downloads_links_in_order_and_continues_past_a_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

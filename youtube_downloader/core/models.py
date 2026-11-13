@@ -32,11 +32,8 @@ class DownloadMode(str, Enum):
     QUEUE = "queue"
 
 
-# YouTube advertises a machine-translated caption track for well over a hundred
-# languages on most videos.  Fetching all of them is rarely what a person
-# means, and the caption endpoint starts answering HTTP 429 partway through,
-# which would abandon the run.  The engine therefore asks for at most this many
-# languages and says so in the UI rather than failing silently.
+# Manual caption tracks are usually few, but some providers expose many
+# languages/translations. Capping keeps requests bounded and predictable.
 MAX_SUBTITLE_LANGUAGES = 25
 
 
@@ -56,39 +53,20 @@ class SubtitleFormat(str, Enum):
 
 
 class SubtitleSource(str, Enum):
-    """Whether to prefer human-authored captions or include auto-generated ones."""
+    """Which caption tracks to save."""
 
-    PREFERRED = "preferred"
-    AUTOMATIC = "automatic"
-    ALL = "all"
+    MANUAL = "manual"
 
     @property
     def label(self) -> str:
-        return {
-            SubtitleSource.PREFERRED: "Author-written first",
-            SubtitleSource.AUTOMATIC: "Auto-generated (ASR)",
-            SubtitleSource.ALL: "All available tracks",
-        }[self]
+        return "Author captions"
 
     @property
     def help_text(self) -> str:
-        return {
-            SubtitleSource.PREFERRED: (
-                "Saves author-written captions and falls back to auto-generated ones when a "
-                "language has no human track. Recommended for most videos."
-            ),
-            SubtitleSource.AUTOMATIC: (
-                "Saves only YouTube's speech-recognition captions, up to "
-                f"{MAX_SUBTITLE_LANGUAGES} languages. These exist for almost every video, but "
-                "names, slang, and accents are often mistranscribed."
-            ),
-            SubtitleSource.ALL: (
-                "Saves every caption track YouTube advertises, up to "
-                f"{MAX_SUBTITLE_LANGUAGES} languages. Most videos offer well over a hundred "
-                "machine-translated tracks, and YouTube starts refusing further caption "
-                "requests partway through, so the request is capped."
-            ),
-        }[self]
+        return (
+            "Saves only author-provided/manual caption tracks when the site makes them "
+            "available. Auto-generated captions are not included."
+        )
 
 
 class PlaylistMedia(str, Enum):
@@ -124,39 +102,35 @@ class PlaylistMedia(str, Enum):
 
 
 class SubtitleTrackInfo:
-    """One caption track advertised for a video.
+    """One manual/author-provided caption track advertised for a video."""
 
-    Kept as a plain dataclass so the UI can render a language list without
-    importing yt-dlp types.
-    """
+    __slots__ = ("language_code", "language_name")
 
-    __slots__ = ("language_code", "language_name", "automatic")
-
-    def __init__(self, language_code: str, language_name: str, automatic: bool) -> None:
+    def __init__(self, language_code: str, language_name: str, automatic: bool = False) -> None:
         self.language_code = language_code
         self.language_name = language_name
-        self.automatic = automatic
+        # `automatic` is accepted for compatibility but ignored; auto captions
+        # are not part of the product.
+        _ = automatic
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        kind = "auto" if self.automatic else "manual"
-        return f"SubtitleTrackInfo({self.language_code!r}, {self.language_name!r}, {kind})"
+        return f"SubtitleTrackInfo({self.language_code!r}, {self.language_name!r})"
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, SubtitleTrackInfo):
             return NotImplemented
-        return (
-            self.language_code == other.language_code
-            and self.language_name == other.language_name
-            and self.automatic == other.automatic
-        )
+        return self.language_code == other.language_code and self.language_name == other.language_name
 
     def __hash__(self) -> int:
-        return hash((self.language_code, self.language_name, self.automatic))
+        return hash((self.language_code, self.language_name))
+
+    @property
+    def automatic(self) -> bool:
+        return False
 
     @property
     def display_name(self) -> str:
-        suffix = " (auto-generated)" if self.automatic else ""
-        return f"{self.language_name} [{self.language_code}]{suffix}"
+        return f"{self.language_name} [{self.language_code}]"
 
 
 def estimate_audio_size_bytes(duration: float | None, bitrate: int | None) -> int | None:
@@ -176,12 +150,11 @@ def estimate_audio_size_bytes(duration: float | None, bitrate: int | None) -> in
 
 @dataclass(frozen=True)
 class VideoCodecFamily(str, Enum):
-    """Video codec families YouTube publishes, grouped by broad support.
+    """Broad video codec families, grouped by playback compatibility.
 
-    The app always writes MP4, and it offers H.264 within it because that is what
-    players can be relied on to open.  Note that this is not a re-encode question:
-    YouTube serves VP9 and AV1 in MP4 containers too, so those could be placed in
-    an MP4 without transcoding.  They are passed up for decoder support alone.
+    The app always writes MP4 and offers H.264 within it because that is what
+    players can be relied on to open.  Some sources may provide VP9/AV1 in MP4
+    containers; those can be smaller but are passed up here for decoder support.
     """
 
     H264 = "h264"
@@ -193,10 +166,10 @@ class VideoCodecFamily(str, Enum):
 class StreamPreference(str, Enum):
     """Which stream to pick when several share a resolution.
 
-    ``QUALITY`` keeps the highest-bitrate stream, which is what YouTube's own
-    player tends to serve.  ``SMALLER_FILE`` keeps the smallest stream that can
-    still be written to MP4 without re-encoding, trading a little visible
-    quality for a materially smaller download.
+    ``QUALITY`` keeps the highest-bitrate compatible stream. ``SMALLER_FILE``
+    keeps the smallest stream that can still be written to MP4 without
+    re-encoding, trading a little visible quality for a materially smaller
+    download.
     """
 
     QUALITY = "quality"
@@ -414,11 +387,11 @@ class VideoInfo:
 
     @property
     def manual_subtitle_tracks(self) -> tuple[SubtitleTrackInfo, ...]:
-        return tuple(track for track in self.subtitle_tracks if not track.automatic)
+        return tuple(self.subtitle_tracks)
 
     @property
     def automatic_subtitle_tracks(self) -> tuple[SubtitleTrackInfo, ...]:
-        return tuple(track for track in self.subtitle_tracks if track.automatic)
+        return ()
 
 
 @dataclass(frozen=True)
@@ -457,7 +430,7 @@ class DownloadRequest:
     audio_bitrate: int | None = None
     preference: StreamPreference = StreamPreference.QUALITY
     subtitle_format: SubtitleFormat = SubtitleFormat.SRT
-    subtitle_source: SubtitleSource = SubtitleSource.PREFERRED
+    subtitle_source: SubtitleSource = SubtitleSource.MANUAL
     subtitle_language: str = ""
     embed_cover: bool = True
 
@@ -480,7 +453,7 @@ class PlaylistDownloadRequest:
     selected_video_ids: tuple[str, ...] | None = None
     preference: StreamPreference = StreamPreference.QUALITY
     subtitle_format: SubtitleFormat = SubtitleFormat.SRT
-    subtitle_source: SubtitleSource = SubtitleSource.PREFERRED
+    subtitle_source: SubtitleSource = SubtitleSource.MANUAL
     embed_cover: bool = True
 
 
@@ -511,7 +484,7 @@ class QueueDownloadRequest:
     audio_bitrate: int | None = None
     preference: StreamPreference = StreamPreference.QUALITY
     subtitle_format: SubtitleFormat = SubtitleFormat.SRT
-    subtitle_source: SubtitleSource = SubtitleSource.PREFERRED
+    subtitle_source: SubtitleSource = SubtitleSource.MANUAL
     embed_cover: bool = True
 
     @property

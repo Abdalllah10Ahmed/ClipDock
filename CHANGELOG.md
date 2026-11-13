@@ -13,6 +13,21 @@ Release artefacts are attached to GitHub Releases rather than committed. The
 installer for a release is `ClipDock-Setup.exe`; verify it against the SHA-256
 printed at the end of `scripts/build_installer.ps1`.
 
+## [Unreleased]
+
+## [0.5.0] - 2026-11-13
+
+### Changed
+
+- **Best-effort multi-site support.** ClipDock now accepts supported links from popular yt-dlp-supported sites (not YouTube-only). Available formats, quality options, audio, thumbnails, playlists/collections, and captions depend on the site/link, with mixed-site batch queues and per-item error reporting.
+- **Manual/author-provided captions only.** Auto-generated/ASR captions are no longer discovered, offered, or saved. Only author-provided/manual caption tracks are available when provided by the source.
+- **No-watermark preference when available.** ClipDock silently prefers clean/no-watermark media variants when exposed by a site/extractor. If unavailable, it downloads available media without claiming watermark removal.
+- **Photos mode removed.** The unstable Photos workflow has been removed for now. Photo/image-post links are handled only through normal best-effort probing/download behavior where supported.
+
+### Fixed
+
+- **Legacy history/request compatibility.** Older saved requests that referenced removed subtitle-source values are coerced to manual-caption behavior for replay/UI restoration where applicable.
+
 ## [0.4.1] - 2026-11-08
 
 A small maintenance build on top of 0.4.0 for local testing: it carries the
@@ -280,7 +295,8 @@ First public release. Everything below is new.
 - No runtime dependency beyond PySide6 and yt-dlp; both are bundled. FFmpeg is
   the only thing ever downloaded, and only after asking.
 
-[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.2.0...v0.3.0

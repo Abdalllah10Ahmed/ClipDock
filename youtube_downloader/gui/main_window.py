@@ -7,8 +7,8 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QDesktopServices, QPalette
+from PySide6.QtCore import QCoreApplication, QEvent, QObject, QPoint, Qt, QTimer, QUrl, Signal, Slot, QThread
+from PySide6.QtGui import QColor, QDesktopServices, QImage, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -94,7 +94,7 @@ from ..core.updates import (
     launch_installer,
 )
 from ..core.updates import DownloadedUpdate
-from ..core.urls import UrlValidationError, normalize_youtube_playlist_url, normalize_youtube_url
+from ..core.urls import UrlValidationError, normalize_media_url, normalize_playlist_url
 from . import caption
 from .caption import CaptionButton
 from .dependencies import DependencyDialog, checked_devices
@@ -244,6 +244,7 @@ def _piece_fingerprint(
     """
 
     return (tuple(part.name for part in item.parts), item.total_bytes)
+
 
 
 class MainWindow(QMainWindow):
@@ -946,7 +947,7 @@ class MainWindow(QMainWindow):
             self,
             f"About {APP_NAME}",
             f"<b>{APP_NAME} {__version__}</b><br><br>"
-            "Downloads publicly accessible YouTube videos as MP4 or MP3, and saves "
+            "Downloads publicly accessible media as MP4 or MP3 without watermarks when a clean source is available, and saves "
             "their captions.<br><br>"
             f"yt-dlp {ytdlp_version() or 'version unavailable'}<br>"
             "FFmpeg is the only extra component it installs, and only after asking."
@@ -954,7 +955,7 @@ class MainWindow(QMainWindow):
             f"release exists. A newer release can be downloaded and installed from "
             f'there, after you choose Download; nothing installs by itself.'
             f'<br><br><a href="{RELEASES_URL}">{RELEASES_URL}</a>'
-            "<br><br>MIT licensed. Not affiliated with YouTube.",
+            "<br><br>MIT licensed. Not affiliated with any site or service.",
         )
 
     @staticmethod
@@ -1111,7 +1112,7 @@ class MainWindow(QMainWindow):
         title.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header_text_layout.addWidget(title)
 
-        subtitle = QLabel("Paste a YouTube video or playlist link, choose what to save, and download it locally.")
+        subtitle = QLabel("Paste a media or playlist link from a popular supported site, choose what to save, and download it locally. Downloads without watermarks when a clean source is available.")
         subtitle.setObjectName("subtitle")
         subtitle.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         subtitle.setWordWrap(True)
@@ -1161,8 +1162,8 @@ class MainWindow(QMainWindow):
         input_layout = QVBoxLayout(input_group)
         url_row = QHBoxLayout()
         self.url_edit = QLineEdit()
-        self.url_edit.setPlaceholderText("Paste a YouTube video or playlist URL")
-        self.url_edit.setAccessibleName("YouTube video or playlist URL")
+        self.url_edit.setPlaceholderText("Paste a media or playlist URL")
+        self.url_edit.setAccessibleName("Media or playlist URL")
         self.url_edit.setClearButtonEnabled(True)
         self.fetch_button = QPushButton("Fetch details")
         url_row.addWidget(self.url_edit, 1)
@@ -1267,8 +1268,9 @@ class MainWindow(QMainWindow):
                 source.help_text,
                 Qt.ItemDataRole.ToolTipRole,
             )
-        self.subtitle_source_combo.setToolTip(SubtitleSource.PREFERRED.help_text)
-        self.subtitle_source_label = QLabel("Captions from")
+        self.subtitle_source_combo.setToolTip(SubtitleSource.MANUAL.help_text)
+        self.subtitle_source_combo.setEnabled(False)
+        self.subtitle_source_label = QLabel("Captions")
         options_form.addRow(self.subtitle_source_label, self.subtitle_source_combo)
 
         self.subtitle_language_combo = SelectorComboBox()
@@ -1337,6 +1339,7 @@ class MainWindow(QMainWindow):
         self.playlist_summary_label.setWordWrap(True)
         self.playlist_summary_label.setMinimumHeight(24)
         playlist_layout.addWidget(self.playlist_summary_label)
+
         root_layout.addWidget(self.playlist_group)
 
         self.queue_group = QGroupBox("Batch queue")
@@ -1347,7 +1350,7 @@ class MainWindow(QMainWindow):
         self.queue_edit.setObjectName("QueueEditor")
         self.queue_edit.setAccessibleName("Links to download one after another")
         self.queue_edit.setPlaceholderText(
-            "Paste one YouTube link per line.\n"
+            "Paste one media link per line.\n"
             "Blank lines and duplicate links are ignored.\n"
             "A link that fails does not stop the rest."
         )
@@ -2261,9 +2264,9 @@ class MainWindow(QMainWindow):
             return
         try:
             if mode is DownloadMode.PLAYLIST:
-                normalize_youtube_playlist_url(raw_url)
+                normalize_playlist_url(raw_url)
             else:
-                normalize_youtube_url(raw_url)
+                normalize_media_url(raw_url)
         except UrlValidationError as error:
             self._show_error("Invalid link", str(error))
             return
@@ -2435,7 +2438,7 @@ class MainWindow(QMainWindow):
             if not candidate:
                 continue
             try:
-                normalized = normalize_youtube_url(candidate)
+                normalized = normalize_media_url(candidate)
             except UrlValidationError:
                 continue
             if normalized in seen:
@@ -2454,7 +2457,7 @@ class MainWindow(QMainWindow):
             if not candidate:
                 continue
             try:
-                normalized = normalize_youtube_url(candidate)
+                normalized = normalize_media_url(candidate)
             except UrlValidationError:
                 invalid += 1
                 continue
@@ -2536,7 +2539,7 @@ class MainWindow(QMainWindow):
         if duplicates:
             parts.append(f"{duplicates} duplicate{'s' if duplicates != 1 else ''} ignored")
         if invalid:
-            parts.append(f"{invalid} line{'s' if invalid != 1 else ''} not a YouTube link")
+            parts.append(f"{invalid} invalid link{'s' if invalid != 1 else ''}")
         self.queue_summary_label.setText(" · ".join(parts))
 
     def _set_queue_row_status(self, url: str, status: str, title: str = "", size: str = "") -> bool:
@@ -2594,7 +2597,9 @@ class MainWindow(QMainWindow):
         self._update_download_button()
 
     def _playlist_item_changed(self, item: QTableWidgetItem) -> None:
-        if self._updating_playlist_rows or item.column() != PLAYLIST_COLUMN_CHECK:
+        if item.column() != PLAYLIST_COLUMN_CHECK:
+            return
+        if self._updating_playlist_rows:
             return
         video = self._playlist_row_video(item.row())
         if video is None:
@@ -2671,16 +2676,16 @@ class MainWindow(QMainWindow):
         nothing smaller exists at all, it says only that, which is also true.
 
         An unrecognised codec omits the word rather than interpolating it.  The
-        first draft fell back to "another codec" and read "YouTube has a smaller
-        another codec stream here" - a grammar bug, caught by a test written to
-        guard exactly this function.
+        first draft fell back to "another codec" and produced an ungrammatical
+        message - a grammar bug, caught by a test written to guard exactly this
+        function.
         """
 
         unoffered = getattr(quality, "unoffered_smaller_size_bytes", None)
         codec = getattr(quality, "unoffered_smaller_codec", None)
         if not unoffered or unoffered <= 0:
             return (
-                "YouTube offers only one H.264 stream at this resolution, so there "
+                "Only one compatible H.264 stream is available at this resolution, so there "
                 "is nothing smaller to switch to."
             )
         codec_name = {
@@ -2690,16 +2695,16 @@ class MainWindow(QMainWindow):
         }.get(str(codec or "").lower())
         subject = f"a smaller {codec_name} stream" if codec_name else "a smaller stream"
         return (
-            f"YouTube has {subject} here, about {format_size(unoffered)}, but this "
-            f"app only offers H.264, so it is not offered either."
+            f"A {subject} is available here, about {format_size(unoffered)}, but this "
+            f"app only offers H.264 for compatibility, so it is not offered."
         )
 
     def _sync_preference_availability(self) -> None:
         """Offer "smaller file" only where a leaner H.264 stream really exists.
 
-        YouTube publishes a single H.264 stream at some resolutions, and at 1440p
-        and 2160p the smaller streams it does publish are usually VP9 or AV1,
-        which this app does not offer.  Offering the choice there would quietly
+        Some sources publish only one H.264 stream at a resolution, and at 1440p
+        or 2160p a smaller stream may exist in a codec this app does not offer.
+        Offering the choice there would quietly
         hand back the same file, so the entry is disabled and says why instead of
         pretending to save something.
 
@@ -2802,126 +2807,76 @@ class MainWindow(QMainWindow):
                 )
                 self.quality_combo.setItemText(index, label)
 
+    def _manual_subtitle_languages(self) -> tuple[str, ...]:
+        if self.info is None:
+            return ()
+        codes = tuple(dict.fromkeys(track.language_code for track in self.info.manual_subtitle_tracks))
+        if len(codes) > MAX_SUBTITLE_LANGUAGES:
+            return tuple(sorted(codes)[:MAX_SUBTITLE_LANGUAGES])
+        return codes
+
     def _subtitle_summary_text(self, subtitle_format: SubtitleFormat) -> str:
         """Describe the caption file(s) a subtitles run will write."""
 
         extension = subtitle_format.extension
         if self.info is None:
-            return "Captions: fetch video details to see which languages are available"
-        if not self.info.subtitles_available:
-            return "Captions: YouTube advertises none for this video"
-        if self._selected_subtitle_source() is SubtitleSource.ALL:
-            count = len(self._all_subtitle_languages())
-            noun = "file" if count == 1 else "files"
-            advertised = len(self._advertised_subtitle_languages())
-            if advertised > count:
-                return (
-                    f"Captions: {count} {extension} {noun}, one per track "
-                    f"({advertised} advertised, capped at {MAX_SUBTITLE_LANGUAGES})"
-                )
-            return f"Captions: {count} {extension} {noun}, one per advertised track"
-        return f"Captions: one {extension} file"
-
-    def _advertised_subtitle_languages(self) -> tuple[str, ...]:
-        """Every track YouTube advertises, author-written and automatic."""
-
-        if self.info is None:
-            return ()
-        return tuple(
-            dict.fromkeys(track.language_code for track in self.info.subtitle_tracks)
-        )
-
-    def _all_subtitle_languages(self) -> tuple[str, ...]:
-        """The capped set ``ALL`` will actually write.
-
-        Mirrors ``Engine._subtitle_language_options`` so the count shown before
-        a download is the number of files that will appear afterwards.
-        """
-
-        return tuple(sorted(self._advertised_subtitle_languages())[:MAX_SUBTITLE_LANGUAGES])
+            return "Captions: fetch details to see which author captions are available"
+        languages = self._manual_subtitle_languages()
+        if not languages:
+            return "Captions: no author-provided captions are available for this media"
+        selected = self.subtitle_language_combo.currentData() if self.subtitle_language_combo.count() else ""
+        if selected:
+            return f"Captions: one {extension} file for the selected language"
+        count = len(languages)
+        noun = "file" if count == 1 else "files"
+        return f"Captions: {count} author {extension} {noun}"
 
     def _selected_subtitle_language(self, mode: DownloadMode) -> str:
-        """The one language to request, or empty to let the source decide.
-
-        ``ALL`` must send nothing so the engine applies its own capped list
-        rather than being handed an uncapped "everything" request.
-        """
+        """The one language to request, or empty to save all available manual captions."""
 
         if mode is not DownloadMode.SUBTITLES:
-            return ""
-        if self._selected_subtitle_source() is SubtitleSource.ALL:
             return ""
         value = self.subtitle_language_combo.currentData()
         return str(value) if value else ""
 
     def _subtitle_languages_for_display(self) -> tuple[str, ...]:
-        """Language codes a subtitles run would write for the current source.
-
-        This mirrors ``Engine._subtitle_language_options`` so the UI reports
-        exactly what the job will attempt, including the author-first fallback.
-        """
-
         if self.info is None:
             return ()
-        source = self._selected_subtitle_source()
-        if source is SubtitleSource.ALL:
-            return self._all_subtitle_languages()
-        automatic = tuple(
-            sorted(
-                {
-                    track.language_code
-                    for track in self.info.automatic_subtitle_tracks
-                }
-            )
-        )[:MAX_SUBTITLE_LANGUAGES]
-        if source is SubtitleSource.AUTOMATIC:
-            return automatic
-        manual = tuple(
-            dict.fromkeys(track.language_code for track in self.info.manual_subtitle_tracks)
-        )
-        if manual:
-            return manual
-        return automatic
+        return self._manual_subtitle_languages()
 
     def _populate_subtitle_languages(self) -> None:
-        """Fill the language combo from the tracks the current source allows."""
+        """Fill the language combo from available manual caption tracks."""
 
         current = self.subtitle_language_combo.currentData()
         self.subtitle_language_combo.blockSignals(True)
         try:
             self.subtitle_language_combo.clear()
-            if self._selected_subtitle_source() is SubtitleSource.ALL:
-                count = len(self._all_subtitle_languages())
-                self.subtitle_language_combo.addItem(f"All advertised tracks ({count})", "")
-                self.subtitle_language_combo.setToolTip(
-                    SubtitleSource.ALL.help_text
-                )
-                return
             languages = self._subtitle_languages_for_display()
             if not languages:
-                self.subtitle_language_combo.addItem("No captions advertised", "")
+                self.subtitle_language_combo.addItem("No author captions available", "")
+                self.subtitle_language_combo.setToolTip("This media does not advertise author-provided captions.")
                 return
+            # Empty data means "all available manual captions" (capped by engine/models rules).
+            self.subtitle_language_combo.addItem(f"All author captions ({len(languages)})", "")
             names = self._subtitle_language_names(languages)
             for code in languages:
                 self.subtitle_language_combo.addItem(names.get(code, code), code)
             index = self.subtitle_language_combo.findData(current)
             if index >= 0:
                 self.subtitle_language_combo.setCurrentIndex(index)
+            self.subtitle_language_combo.setToolTip("Choose one author-caption language, or save all available author captions.")
         finally:
             self.subtitle_language_combo.blockSignals(False)
 
     def _subtitle_language_names(self, languages: tuple[str, ...]) -> dict[str, str]:
-        """Map a language code to the best display name yt-dlp advertised."""
+        """Map a language code to the display name advertised for manual captions."""
 
         names: dict[str, str] = {}
+        wanted = set(languages)
         for track in self.info.subtitle_tracks if self.info is not None else ():
-            if track.language_code not in languages:
+            if track.language_code not in wanted:
                 continue
-            existing = names.get(track.language_code)
-            # A manual track is a better label than its auto-generated twin.
-            if existing is None or (not track.automatic and existing.endswith("(auto)")):
-                suffix = " (auto)" if track.automatic else ""
-                names[track.language_code] = f"{track.language_name}{suffix}"
+            names.setdefault(track.language_code, track.language_name or track.language_code)
         return names
 
     def _update_queue_summary(self) -> None:
@@ -2950,6 +2905,7 @@ class MainWindow(QMainWindow):
                 f"Queued {len(links)} {noun} link{plural}: each link is read first, "
                 "so a failure does not stop the rest."
             )
+
 
     def _update_playlist_summary(self) -> None:
         if self.playlist_info is None:
@@ -3014,6 +2970,9 @@ class MainWindow(QMainWindow):
         is_playlist = mode is DownloadMode.PLAYLIST
         is_queue = mode is DownloadMode.QUEUE
         self.playlist_group.setVisible(is_playlist)
+        if is_playlist:
+            self.playlist_group.setTitle("Playlist videos")
+            self.playlist_selection_label.setText("Choose which videos to download:")
         self.queue_group.setVisible(is_queue)
         self.playlist_media_label.setVisible(is_playlist)
         self.playlist_media_combo.setVisible(is_playlist)
@@ -3076,11 +3035,12 @@ class MainWindow(QMainWindow):
             visible = media is PlaylistMedia.SUBTITLES
         else:
             visible = mode is DownloadMode.SUBTITLES or mode is DownloadMode.QUEUE
+        # Captions are author-provided/manual only; no source selector is shown.
+        self.subtitle_source_label.setVisible(False)
+        self.subtitle_source_combo.setVisible(False)
         for widget in (
             self.subtitle_format_label,
             self.subtitle_format_combo,
-            self.subtitle_source_label,
-            self.subtitle_source_combo,
             self.subtitle_language_label,
             self.subtitle_language_combo,
         ):
@@ -3124,7 +3084,7 @@ class MainWindow(QMainWindow):
         try:
             return SubtitleSource(value)
         except ValueError:
-            return SubtitleSource.PREFERRED
+            return SubtitleSource.MANUAL
 
     def _preference_changed(self, _index: int = -1) -> None:
         """Re-cost every size under the new stream preference."""
@@ -3170,7 +3130,7 @@ class MainWindow(QMainWindow):
                 return
             valid = True
             if mode is DownloadMode.VIDEO:
-                valid = isinstance(self._selected_quality(), VideoQuality) and self.info.audio_available
+                valid = isinstance(self._selected_quality(), VideoQuality)
             elif mode is DownloadMode.AUDIO:
                 valid = self.info.audio_available and self.bitrate_combo.currentData() in {128, 192, 256, 320}
             elif mode is DownloadMode.THUMBNAIL:
@@ -3219,7 +3179,7 @@ class MainWindow(QMainWindow):
             if not links:
                 self._show_error(
                     "No links in the queue",
-                    "Paste at least one YouTube link, one per line.",
+                    "Paste at least one media link, one per line.",
                 )
                 return
             queue_media = self._selected_queue_media()
@@ -3267,6 +3227,8 @@ class MainWindow(QMainWindow):
         def operation(progress: Any, cancel_check: Any) -> Any:
             if mode is DownloadMode.PLAYLIST:
                 return self.engine.download_playlist(request, progress=progress, cancel_check=cancel_check)
+            if mode is DownloadMode.QUEUE:
+                return self.engine.download_queue(request, progress=progress, cancel_check=cancel_check)
             return self.engine.download(request, progress=progress, cancel_check=cancel_check)
 
         self._start_download_job(request, message, operation)
@@ -3492,7 +3454,7 @@ class MainWindow(QMainWindow):
             return
         self._set_busy(False)
         # A history Resume/Retry re-reads the video or playlist first, because a
-        # request cannot be rebuilt without the qualities YouTube is offering
+        # request cannot be rebuilt without the formats/options currently offered
         # now.  The probe's own result was stored by `_on_job_succeeded`; this
         # is where it becomes the download the button promised.
         if self._pending_resume is not None and self._pending_resume_info is not None:
@@ -3514,12 +3476,13 @@ class MainWindow(QMainWindow):
             self._pending_resume_info = result
             return
 
+
         if isinstance(result, VideoInfo):
             self.playlist_info = None
             self.info = result
             duration = self._format_duration(result.duration)
-            live_marker = " · live" if result.is_live else ""
-            self.title_label.setText(f"{result.title} · {duration}{live_marker}" if duration else result.title)
+            live_marker = " - live" if getattr(result, 'is_live', False) else ""
+            self.title_label.setText(f"{result.title} - {duration}{live_marker}" if duration else result.title)
             self.quality_combo.clear()
             for quality in result.qualities:
                 self.quality_combo.addItem(quality.resolution_label, quality)
@@ -3530,20 +3493,21 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(100)
             self._progress_value = 100
-            self._set_busy(False, "Video details ready — choose a download mode")
+            self._set_busy(False, "Video details ready - choose a download mode")
+            self._update_download_button()
             return
 
         if isinstance(result, PlaylistInfo):
             self.info = None
             self.playlist_info = result
-            skipped = f" · {result.skipped_count} skipped" if result.skipped_count else ""
+            skipped = f" - {result.skipped_count} skipped" if result.skipped_count else ""
             unavailable = (
-                f" · {result.unavailable_video_count} unavailable"
-                if result.unavailable_video_count
+                f" - {result.unavailable_video_count} unavailable"
+                if getattr(result, 'unavailable_video_count', 0)
                 else ""
             )
             self.title_label.setText(
-                f"{result.title} · {result.video_count} videos{unavailable}{skipped}"
+                f"{result.title} - {result.video_count} videos{unavailable}{skipped}"
             )
             self.quality_combo.clear()
             for quality in result.qualities:
@@ -3554,7 +3518,8 @@ class MainWindow(QMainWindow):
             self.progress_bar.setRange(0, 100)
             self.progress_bar.setValue(100)
             self._progress_value = 100
-            self._set_busy(False, "Playlist details ready — choose videos, media, and one quality")
+            self._set_busy(False, "Playlist details ready - choose videos, media, and one quality")
+            self._update_download_button()
             return
 
         if isinstance(result, PlaylistDownloadResult):
@@ -3661,8 +3626,8 @@ class MainWindow(QMainWindow):
                 )
             else:
                 self.status_label.setText(f"Saved to: {path}")
-            # A run YouTube cut short still saved real files, so the reason it
-            # stopped is shown next to them rather than replacing them.
+            # A run that was cut short may still have saved real files, so the
+            # reason is shown next to them rather than replacing them.
             warning = getattr(result, "warning", "")
             if warning:
                 self.status_label.setText(f"{self.status_label.text()} · {warning}")
@@ -3952,10 +3917,10 @@ class MainWindow(QMainWindow):
         in the hidden staging folder for that destination, which is why one
         method serves both.
 
-        A queued batch is the only case that can begin without asking YouTube
-        anything: every link, and the one quality they share, is in the entry
-        already.  A single video and a playlist are re-read first because their
-        requests are built against the qualities offered now; a stale list would
+        A queued batch is the only case that can begin without re-fetching details:
+        every link, and the shared choices, are in the entry already.  A single
+        item and a playlist are re-read first because their requests are built
+        against the options offered now; a stale list would
         make the engine quietly ignore the quality that was asked for.
         """
 
@@ -4066,7 +4031,7 @@ class MainWindow(QMainWindow):
             audio_bitrate=bitrate if media is DownloadMode.AUDIO else None,
             preference=self._enum_from(StreamPreference, stored.get("preference"), StreamPreference.QUALITY),
             subtitle_format=self._enum_from(SubtitleFormat, stored.get("subtitle_format"), SubtitleFormat.SRT),
-            subtitle_source=self._enum_from(SubtitleSource, stored.get("subtitle_source"), SubtitleSource.PREFERRED),
+            subtitle_source=self._enum_from(SubtitleSource, stored.get("subtitle_source"), SubtitleSource.MANUAL),
             embed_cover=bool(stored.get("embed_cover", True)),
         )
 
@@ -4084,7 +4049,7 @@ class MainWindow(QMainWindow):
 
         The probe exists only because a request cannot be rebuilt without the
         details it was made against: the qualities, audio availability, and a
-        playlist's videos are all read from YouTube at the moment a job begins.
+        playlist's items are read from the source at the moment a job begins.
         The recorded choices are then re-applied to that fresh answer, which is
         the same thing Retry did before - the difference is only which outcome
         preceded it.
@@ -4107,7 +4072,7 @@ class MainWindow(QMainWindow):
         output_dir = Path(folder)
         preference = self._enum_from(StreamPreference, stored.get("preference"), StreamPreference.QUALITY)
         subtitle_format = self._enum_from(SubtitleFormat, stored.get("subtitle_format"), SubtitleFormat.SRT)
-        subtitle_source = self._enum_from(SubtitleSource, stored.get("subtitle_source"), SubtitleSource.PREFERRED)
+        subtitle_source = self._enum_from(SubtitleSource, stored.get("subtitle_source"), SubtitleSource.MANUAL)
         embed_cover = bool(stored.get("embed_cover", True))
         bitrate = self._int_or_none(stored.get("audio_bitrate"))
 
@@ -4188,9 +4153,10 @@ class MainWindow(QMainWindow):
             self.subtitle_format_combo,
             str(stored.get("subtitle_format") or SubtitleFormat.SRT.value),
         )
+        legacy_source = self._enum_from(SubtitleSource, stored.get("subtitle_source"), SubtitleSource.MANUAL)
         self._select_combo_value(
             self.subtitle_source_combo,
-            str(stored.get("subtitle_source") or SubtitleSource.PREFERRED.value),
+            legacy_source.value if hasattr(legacy_source, "value") else SubtitleSource.MANUAL.value,
         )
         self.embed_cover_checkbox.setChecked(bool(stored.get("embed_cover", True)))
 
@@ -4227,7 +4193,7 @@ class MainWindow(QMainWindow):
         """Match a recorded quality against what the video offers now.
 
         The format id is tried first because it identifies one stream exactly.
-        Height is the fallback, because YouTube retires ids routinely and a
+        Height is the fallback, because format ids can change over time and a
         resumed job should survive that; the nearest frame rate breaks a tie
         between, say, 1080p60 and 1080p30.
         """

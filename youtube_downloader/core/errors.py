@@ -99,9 +99,9 @@ def rate_limited_failure() -> DownloadFailure:
     """
 
     return DownloadFailure(
-        "YouTube refused the request because too many were sent too quickly (HTTP 429). "
+        "The site refused the request because too many were sent too quickly (HTTP 429). "
         "That is a limit on the service rather than a problem with your connection; "
-        "wait a few minutes and try again. A long caption batch is the usual cause.",
+        "wait a few minutes and try again. A long caption batch can be a cause.",
         code="rate_limited",
     )
 
@@ -139,51 +139,56 @@ def friendly_error(error: BaseException) -> AppError:
     if ("not available in your country" in text or "geo restricted" in text or "geo-restricted" in text or ("region" in text and "available" in text)):
         return UnsupportedContentError("This video is not available from the current region.")
     if "video unavailable" in text or "has been removed" in text or "no longer available" in text or "does not exist" in text:
-        return UnsupportedContentError("This video is unavailable, removed, or restricted by YouTube.")
+        return UnsupportedContentError("This media is unavailable, removed, or restricted by the site.")
     if "live stream" in text or "live event" in text or "premiere" in text:
-        return UnsupportedContentError("Live streams and premieres cannot be downloaded with this version.")
+        return UnsupportedContentError("Live streams and premieres are not supported for this download.")
     if "copyright" in text or "dmca" in text or "copyrighted" in text:
-        return UnsupportedContentError("This video is blocked due to a copyright claim.")
+        return UnsupportedContentError("This media is blocked due to a copyright claim.")
     if "inappropriate" in text or "community guidelines" in text:
-        return UnsupportedContentError("This video was removed for violating YouTube's community guidelines.")
+        return UnsupportedContentError("This media was removed for violating the site's guidelines.")
     if "drm" in text or ("protected" in text and "content" in text):
-        return UnsupportedContentError("This video is protected and cannot be downloaded by this application.")
+        return UnsupportedContentError("This media is protected and cannot be downloaded by this application.")
     if any(token in text for token in ("js challenge", "javascript challenge", "challenge solver", "challengeprovider", "jscallengeproviderrejectedrequest", "yt-dlp-ejs", "yt_dlp_ejs", "remote component")):
         return DependencyError(
-            "YouTube needs a JavaScript runtime to verify this video. ClipDock does not bundle one, "
+            "This site needs a JavaScript runtime to verify the request. ClipDock does not bundle one, "
             "but it uses Node.js, Deno, Bun or QuickJS when one is already installed - install Node.js "
             "(the usual choice) and try again."
         )
     if "sign in to confirm" in text or ("bot" in text and "confirm" in text) or "login required" in text or "sign in required" in text:
-        return DownloadFailure("YouTube asked for additional verification. This version does not use accounts or bypass that check.", code="verification_required")
+        return DownloadFailure("The site asked for additional verification. This version does not use accounts or bypass that check.", code="verification_required")
     if "cookie" in text or "cookies" in text:
-        return DependencyError("YouTube requires cookies for this video. This version does not store or use account cookies.", code="cookies_required")
+        return DependencyError("This site requires cookies or sign-in for this media. This version does not store or use account cookies.", code="cookies_required")
     if "requested format is not available" in text or "no video formats" in text or "no formats" in text:
         return DownloadFailure("The selected quality is no longer available. Fetch the video details again and choose another option.", code="format_changed")
     if "http error 403" in text or "403: forbidden" in text:
-        # A media URL carries a signature and an expiry; by the time a long
+        # A media URL may carry a signature and an expiry; by the time a long
         # download reaches for a later fragment the signature can be stale.
-        # Fetching the details again issues a fresh one, which is why the second
-        # tap used to work and is now the advice rather than a mystery.
+        # Fetching the details again issues a fresh one.
         return DownloadFailure(
-            "YouTube refused the media request (HTTP 403). Fetch the video details again and retry; "
-            "a partial download will continue from where it stopped.",
+            "The site refused the media request (HTTP 403). Fetch details again and retry; "
+            "a partial download may continue from where it stopped.",
             code="download_failed",
         )
     if "unable to download video data" in text or "unable to download audio" in text:
         return DownloadFailure(
-            "YouTube stopped sending the media before the file was complete. "
-            "Fetch the video details again and retry; a partial download will continue.",
+            "The site stopped sending the media before the file was complete. "
+            "Fetch details again and retry; a partial download may continue.",
             code="download_failed",
         )
     if "unsupported url" in text or "no suitable extractor" in text:
-        return ExtractionError("This link is not a supported YouTube video link.", code="unsupported_url")
+        return ExtractionError(
+            "This link is not supported by the current extractor. Check the URL or try a different link.",
+            code="unsupported_url",
+        )
     # The rate limit is deliberately absent here: it is classified above, so a
     # 429 can no longer be reported as a broken connection.
     if any(token in text for token in ("timed out", "timeout", "connection reset", "connection refused", "temporary failure", "network is unreachable", "getaddrinfo", "ssl", "remote end closed", "service unavailable", "http error 5", "http error 503")):
         return DownloadFailure("The network connection was interrupted or unavailable. Check the connection and try again; partial downloads may resume.", code="network_failure")
     if "unable to download webpage" in text or "failed to parse" in text or ("extract" in text and "failed" in text):
-        return ExtractionError("YouTube could not be queried. The site or extractor may have changed; update the bundled yt-dlp dependency and try again.", code="extractor_changed")
+        return ExtractionError(
+            "The site could not be queried. The page, extractor, or site may have changed; try again or update yt-dlp.",
+            code="extractor_changed",
+        )
 
     if isinstance(error, TimeoutError):
         return DownloadFailure("The operation timed out. Check the network connection and try again.", code="network_failure")
@@ -204,7 +209,7 @@ def friendly_error(error: BaseException) -> AppError:
     if isinstance(error, OSError):
         return StorageError("The file could not be written. Check the destination folder and available disk space.")
     if error.__class__.__name__ in {"DownloadError", "ExtractorError", "YoutubeDLError"}:
-        return DownloadFailure("The download could not be completed because YouTube returned an error. Fetch the details again or try a different quality.", code="download_failed")
+        return DownloadFailure("The download could not be completed because the site or extractor returned an error. Fetch details again or try a different option.", code="download_failed")
     return DownloadFailure("An unexpected error stopped the operation. Try again; if it persists, check the application log.", code="unexpected")
 
 
