@@ -6,6 +6,27 @@ ClipDock is a Windows 10/11 desktop app for downloading publicly accessible medi
 
 When a site provides a clean/no-watermark variant, ClipDock prefers it automatically. If no clean variant is exposed, it downloads the available media without claiming watermark removal.
 
+## Screenshots
+
+![ClipDock main window](docs/screenshot.png)
+
+<details>
+<summary>More screenshots</summary>
+
+**Playlist mode**
+
+![Playlist mode](docs/screenshot-playlist.png)
+
+**Dark theme (Nord)**
+
+![Nord theme](docs/screenshot-dark.png)
+
+**First-run FFmpeg prompt**
+
+![First-run FFmpeg prompt](docs/screenshot-first-run.png)
+
+</details>
+
 ## Install (recommended)
 
 1. Download **`ClipDock-Setup.exe`** from the [Releases](https://github.com/Abdalllah10Ahmed/ClipDock/releases) page.
