@@ -22,7 +22,7 @@
 ; apart.  AppPublisher shows in Apps and Features and on the installer's file
 ; properties; change it if you want a real name there.
 #define ProductName "ClipDock"
-#define ProductVersion "0.5.2"
+#define ProductVersion "0.5.3"
 #define ProductPublisher "ClipDock"
 #define ProductExeName "ClipDock.exe"
 

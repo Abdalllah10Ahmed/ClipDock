@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import PropertyMock, patch
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QMimeData, QPoint, Qt, QUrl
 from PySide6.QtGui import QColor, QIcon, QImage, QPalette, QPixmap, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QScrollArea, QPushButton
@@ -397,6 +397,28 @@ class SmallerFileExplanationTests(unittest.TestCase):
         self.assertIn(format_size(refused), message)
         self.assertNotIn("None", message)
         self.assertIn("smaller stream", message.lower())
+
+
+class FakeDropEvent:
+    """The two verbs the drop handlers use, with the mime data they carry.
+
+    A real QDropEvent cannot be constructed without a drag source, and what
+    these tests are about is the decision the window makes, not Qt's delivery.
+    """
+
+    def __init__(self, mime: QMimeData) -> None:
+        self._mime = mime
+        self.accepted = False
+        self.ignored = False
+
+    def mimeData(self) -> QMimeData:
+        return self._mime
+
+    def acceptProposedAction(self) -> None:
+        self.accepted = True
+
+    def ignore(self) -> None:
+        self.ignored = True
 
 
 class GuiSmokeTests(unittest.TestCase):
@@ -1101,8 +1123,10 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(window._theme, "gruvbox")
         window.close()
         self.app.processEvents()
+        # The theme is the thing this test is about; the close also records the
+        # window rectangle, which is a separate promise with its own tests.
         self.assertEqual(
-            main_window.read_settings(), {THEME_SETTING_KEY: "gruvbox"}
+            main_window.read_settings().get(THEME_SETTING_KEY), "gruvbox"
         )
 
         # A second window, as if the program had been closed and reopened.
@@ -1716,11 +1740,12 @@ class GuiSmokeTests(unittest.TestCase):
             buttons = toast.findChildren(QPushButton)
             self.assertEqual(
                 [button.objectName() for button in buttons],
-                ["updateToastClose", "updateToastOpen"],
-                "the notice offers something other than opening a web page",
+                ["updateToastClose", "updateToastOpen", "updateToastSkip"],
+                "the notice does not offer the actions it promises",
             )
             texts = [button.text() for button in buttons]
             self.assertIn("Open the release page", texts)
+            self.assertIn("Skip this version", texts)
             for button in buttons:
                 self.assertNotIn("install", button.text().lower())
                 self.assertNotIn("update now", button.text().lower())
@@ -1762,6 +1787,280 @@ class GuiSmokeTests(unittest.TestCase):
                 RELEASES_URL,
                 "a link that is not https was handed to the desktop",
             )
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_skipping_a_release_silences_only_that_release(self) -> None:
+        # "Check automatically" is a standing request, and a release someone
+        # does not want must not become a launch-time nag.  The skip names one
+        # version; a later version is news again, and the manual check - an
+        # explicit question - always answers.
+        window = MainWindow(FakeEngine())
+        try:
+            window.show()
+            self.app.processEvents()
+            skipped = UpdateCheck(status="newer", current="0.2.0", latest="0.3.0")
+            window._report_update(skipped, automatic=True)
+            assert window._update_toast is not None
+            skip_button = window._update_toast.findChild(
+                QPushButton, "updateToastSkip"
+            )
+            self.assertIsNotNone(skip_button, "the notice cannot be silenced")
+            assert skip_button is not None
+            skip_button.click()
+            self.assertEqual(
+                main_window.read_settings().get(main_window.UPDATE_SKIP_SETTING_KEY),
+                "0.3.0",
+            )
+            self.assertFalse(window._update_toast.isVisibleTo(window))
+
+            window._report_update(skipped, automatic=True)
+            self.assertFalse(
+                window._update_toast.isVisibleTo(window),
+                "the skipped release was offered again on the next check",
+            )
+
+            window._report_update(
+                UpdateCheck(status="newer", current="0.2.0", latest="0.4.0"),
+                automatic=True,
+            )
+            self.assertTrue(
+                window._update_toast.isVisibleTo(window),
+                "a release newer than the skipped one was treated as skipped too",
+            )
+
+            with patch("youtube_downloader.gui.main_window.QMessageBox") as boxes:
+                window._report_update(skipped, automatic=False)
+            boxes.assert_called_once()
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_window_returns_to_where_it_was_left(self) -> None:
+        screen = QApplication.primaryScreen().availableGeometry()
+        width = min(900, max(760, screen.width() - 40))
+        height = min(700, max(540, screen.height() - 40))
+        x = screen.left() + 20
+        y = screen.top() + 20
+        main_window.write_setting(
+            main_window.WINDOW_GEOMETRY_SETTING_KEY,
+            f"{x},{y},{width},{height},0",
+        )
+        window = MainWindow(FakeEngine())
+        try:
+            self.assertEqual(window.geometry().getRect(), (x, y, width, height))
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_a_saved_window_off_screen_or_unreadable_is_ignored(self) -> None:
+        # A monitor unplugged since the last launch, or a hand-edited settings
+        # file, must not open the program where nobody can reach it.
+        for stored in ("50000,50000,900,700,0", "not,a,rectangle,at,all", "1,2,0,0,0"):
+            with self.subTest(stored=stored):
+                main_window.write_setting(
+                    main_window.WINDOW_GEOMETRY_SETTING_KEY, stored
+                )
+                window = MainWindow(FakeEngine())
+                try:
+                    self.assertEqual(window.size().width(), 860)
+                    self.assertEqual(window.size().height(), 700)
+                finally:
+                    window.close()
+                    self.app.processEvents()
+
+    def test_a_maximized_window_starts_maximized_again(self) -> None:
+        screen = QApplication.primaryScreen().availableGeometry()
+        main_window.write_setting(
+            main_window.WINDOW_GEOMETRY_SETTING_KEY,
+            f"{screen.left()},{screen.top()},760,540,1",
+        )
+        window = MainWindow(FakeEngine())
+        try:
+            self.assertFalse(window.isVisible(), "construction showed the window")
+            window.show()
+            self.app.processEvents()
+            self.assertTrue(window.isMaximized())
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_the_window_rectangle_is_remembered_on_close(self) -> None:
+        window = MainWindow(FakeEngine())
+        try:
+            window.show()
+            self.app.processEvents()
+            window.setGeometry(40, 60, 780, 600)
+            self.app.processEvents()
+            window.close()
+            self.app.processEvents()
+        finally:
+            if window.isVisible():
+                window.close()
+        stored = main_window.read_settings().get(
+            main_window.WINDOW_GEOMETRY_SETTING_KEY, ""
+        )
+        parts = [int(part) for part in stored.split(",")]
+        self.assertEqual(parts[:4], [40, 60, 780, 600])
+        self.assertEqual(parts[4], 0)
+
+    def test_the_last_destination_is_remembered(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        main_window.write_setting(
+            main_window.DESTINATION_SETTING_KEY, directory.name
+        )
+        window = MainWindow(FakeEngine())
+        try:
+            self.assertEqual(window.destination_edit.text(), directory.name)
+            self.assertEqual(window._last_directory, Path(directory.name))
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_a_deleted_destination_falls_back_to_the_default(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        gone = Path(directory.name) / "gone"
+        main_window.write_setting(main_window.DESTINATION_SETTING_KEY, str(gone))
+        window = MainWindow(FakeEngine())
+        try:
+            expected = MainWindow._default_download_directory()
+            self.assertEqual(window.destination_edit.text(), str(expected))
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_choosing_a_destination_is_remembered_immediately(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        window = MainWindow(FakeEngine())
+        try:
+            with patch(
+                "youtube_downloader.gui.main_window.QFileDialog.getExistingDirectory",
+                return_value=directory.name,
+            ):
+                window._choose_destination()
+            self.assertEqual(
+                main_window.read_settings().get(main_window.DESTINATION_SETTING_KEY),
+                directory.name,
+            )
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_a_typed_destination_is_remembered_on_close(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        window = MainWindow(FakeEngine())
+        window.destination_edit.setText(directory.name)
+        window.close()
+        self.app.processEvents()
+        self.assertEqual(
+            main_window.read_settings().get(main_window.DESTINATION_SETTING_KEY),
+            directory.name,
+        )
+
+    def test_one_dropped_link_fills_the_field_and_starts_nothing(self) -> None:
+        window = MainWindow(FakeEngine())
+        try:
+            mime = QMimeData()
+            mime.setUrls([QUrl("https://youtu.be/abc123")])
+            event = FakeDropEvent(mime)
+            window.dragEnterEvent(event)
+            self.assertTrue(event.accepted)
+            window.dropEvent(event)
+            self.assertTrue(event.accepted)
+            self.assertEqual(window.url_edit.text(), "https://youtu.be/abc123")
+            self.assertIs(window._selected_mode(), DownloadMode.VIDEO)
+            self.assertFalse(
+                window.controller.is_running,
+                "dropping a link started a job nobody asked for",
+            )
+            self.assertEqual(window.queue_edit.toPlainText(), "")
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_several_dropped_links_build_a_batch_queue(self) -> None:
+        window = MainWindow(FakeEngine())
+        try:
+            mime = QMimeData()
+            mime.setUrls(
+                [
+                    QUrl("https://youtu.be/one"),
+                    QUrl("https://youtu.be/two"),
+                    QUrl("https://youtu.be/three"),
+                ]
+            )
+            event = FakeDropEvent(mime)
+            window.dragEnterEvent(event)
+            window.dropEvent(event)
+            self.assertIs(window._selected_mode(), DownloadMode.QUEUE)
+            self.assertEqual(
+                window.queue_edit.toPlainText().splitlines(),
+                [
+                    "https://youtu.be/one",
+                    "https://youtu.be/two",
+                    "https://youtu.be/three",
+                ],
+            )
+            self.assertFalse(window.controller.is_running)
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_a_dropped_link_already_queued_is_not_added_twice(self) -> None:
+        window = MainWindow(FakeEngine())
+        try:
+            window._select_combo_value(
+                window.mode_combo, DownloadMode.QUEUE.value
+            )
+            window.queue_edit.setPlainText("https://youtu.be/one")
+            mime = QMimeData()
+            mime.setText("https://youtu.be/one")
+            event = FakeDropEvent(mime)
+            window.dropEvent(event)
+            self.assertEqual(window.queue_edit.toPlainText(), "https://youtu.be/one")
+            self.assertIn("already", window.status_bar.currentMessage())
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_a_drop_that_is_not_a_link_is_refused(self) -> None:
+        window = MainWindow(FakeEngine())
+        try:
+            mime = QMimeData()
+            mime.setUrls([QUrl.fromLocalFile(str(Path.cwd()))])
+            event = FakeDropEvent(mime)
+            window.dragEnterEvent(event)
+            self.assertTrue(event.ignored, "a folder was offered as a download")
+            window.dropEvent(event)
+            self.assertTrue(event.ignored)
+            self.assertEqual(window.url_edit.text(), "")
+            self.assertEqual(window.queue_edit.toPlainText(), "")
+        finally:
+            window.close()
+            self.app.processEvents()
+
+    def test_dropping_is_refused_while_a_job_is_running(self) -> None:
+        window = MainWindow(FakeEngine())
+        try:
+            mime = QMimeData()
+            mime.setUrls([QUrl("https://youtu.be/abc123")])
+            event = FakeDropEvent(mime)
+            with patch.object(
+                type(window.controller),
+                "is_running",
+                new_callable=PropertyMock,
+                return_value=True,
+            ):
+                window.dragEnterEvent(event)
+                self.assertTrue(event.ignored)
+                window.dropEvent(event)
+                self.assertTrue(event.ignored)
+            self.assertEqual(window.url_edit.text(), "")
         finally:
             window.close()
             self.app.processEvents()

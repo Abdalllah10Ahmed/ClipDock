@@ -15,6 +15,15 @@ printed at the end of `scripts/build_installer.ps1`.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-15
+
+### Added
+
+- **Skip this version.** The automatic update notice now has a second button that stops ClipDock offering that particular release on later launches. A newer release is still reported, and **Check for ClipDock updates** in the Help menu always answers whatever was skipped. The choice is stored as `update_skip_version` in the settings file.
+- **The window reopens where you left it.** Position, size, and maximized state are remembered on close and restored on the next launch. A monitor that has since been unplugged, a malformed value, or a rectangle below the minimum size falls back to the default window instead of opening somewhere unreachable.
+- **The last download folder is remembered.** The destination field starts at the folder the last download used, and **Browse** stores the new choice immediately. A folder that has since been deleted is not restored.
+- **Links can be dropped onto the window.** One link fills the link field; several switch to **Batch queue** and are appended, with duplicates ignored. A drop only fills a field or extends the queue - it never probes or downloads by itself.
+
 ## [0.5.2] - 2026-11-15
 
 ### Fixed
@@ -308,7 +317,8 @@ First public release. Everything below is new.
 - No runtime dependency beyond PySide6 and yt-dlp; both are bundled. FFmpeg is
   the only thing ever downloaded, and only after asking.
 
-[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.1...v0.5.0

@@ -91,6 +91,7 @@ from ..core.updates import (
     UpdateCheck,
     check_for_updates,
     download_update,
+    is_newer,
     launch_installer,
 )
 from ..core.updates import DownloadedUpdate
@@ -129,6 +130,20 @@ EMBED_COVER_SETTING_KEY = "embed_cover"
 # what the person expects from "check automatically"; it stays well inside
 # GitHub's unauthenticated limit.
 UPDATE_CHECK_SETTING_KEY = "update_check"
+# The release version the person asked not to be told about again.  Stored as
+# the tag the release advertised; a newer release is news again, so the choice
+# expires by itself instead of needing to be undone by hand.
+UPDATE_SKIP_SETTING_KEY = "update_skip_version"
+
+# Where the window was left, as "x,y,width,height,maximized".  Plain numbers
+# rather than Qt's opaque saveGeometry() blob, so the settings file stays
+# readable and a hand-edited value can be understood.
+WINDOW_GEOMETRY_SETTING_KEY = "window_geometry"
+
+# The folder the last download was saved to.  Written only when the folder
+# still exists: a destination that has been deleted is worse than none, because
+# the first download would fail instead of falling back to the default.
+DESTINATION_SETTING_KEY = "destination_folder"
 
 # How long after the window appears before the automatic check runs.  Long
 # enough that startup is genuinely over and the person has had the window for
@@ -255,7 +270,13 @@ class MainWindow(QMainWindow):
         self.info: VideoInfo | None = None
         self.playlist_info: PlaylistInfo | None = None
         self._progress_value = -1
-        self._last_directory = self._default_download_directory()
+        self._last_directory = (
+            self._remembered_destination() or self._default_download_directory()
+        )
+        # Set by _restore_window_geometry and spent by showEvent, because a
+        # window that was maximized when it closed should come back that way
+        # without the window showing itself during construction.
+        self._start_maximized = False
         self._playlist_selection: dict[str, bool] = {}
         self._updating_playlist_rows = False
         # Paths from the most recent successful job, used by Open folder / Play.
@@ -386,6 +407,145 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _set_update_check_enabled(enabled: bool) -> None:
         write_setting(UPDATE_CHECK_SETTING_KEY, "1" if enabled else "0")
+
+    @staticmethod
+    def _skipped_update_version() -> str:
+        return read_settings().get(UPDATE_SKIP_SETTING_KEY, "").strip()
+
+    def _update_notice_skipped(self, result: UpdateCheck) -> bool:
+        """Whether the person asked not to hear about this release again.
+
+        Only the automatic notice is suppressed.  The manual check in the Help
+        menu always reports what it finds, so a skipped release stays reachable
+        by the one action that is an explicit question.  A release newer than
+        the skipped one is news again: the choice was about that version, not
+        about updates forever.
+        """
+
+        skipped = self._skipped_update_version()
+        if not skipped or not result.latest:
+            return False
+        return not is_newer(result.latest, skipped)
+
+    def _skip_shown_update(self) -> None:
+        """Remember the release on the toast, and put the toast away.
+
+        The version is the tag the release advertised, so the comparison next
+        launch is between two values from the same source.  Nothing is written
+        anywhere else: the release page, the manual check, and the download
+        flow all stay exactly as they were.
+        """
+
+        result = self._update_toast_result
+        if not isinstance(result, UpdateCheck) or not result.latest:
+            return
+        write_setting(UPDATE_SKIP_SETTING_KEY, result.latest)
+        _LOGGER.info("update_notice_skipped version=%s", result.latest)
+        if self._update_toast is not None:
+            self._update_toast.hide()
+        self.status_bar.showMessage(
+            f"ClipDock will not offer {result.latest} automatically again. "
+            "Check for updates in the Help menu any time.",
+            12000,
+        )
+
+    @staticmethod
+    def _remembered_destination() -> Path | None:
+        """The folder the last download used, if it is still there.
+
+        A saved folder that has since been moved, renamed, or deleted is not a
+        destination: falling back to the default is better than prefilling a
+        path that would fail on the first download.  Which one was chosen goes
+        to the log rather than a dialog, because the field itself shows it.
+        """
+
+        stored = read_settings().get(DESTINATION_SETTING_KEY, "").strip()
+        if not stored:
+            return None
+        candidate = Path(stored)
+        if candidate.is_dir():
+            return candidate
+        _LOGGER.info("destination_fallback reason=saved_folder_missing")
+        return None
+
+    def _remember_destination(self) -> None:
+        """Store the destination field, but only when it points somewhere real.
+
+        The field is editable, so it can hold a typo at the moment the window
+        closes.  A folder that does not exist is skipped instead of remembered:
+        the next launch is better off with the default than with a path that
+        cannot be written to.  The default itself is not stored - a launch
+        without the key already picks it, so a key saying so would only make
+        the file longer - which also clears a saved folder the person has since
+        switched back from.
+        """
+
+        text = self.destination_edit.text().strip()
+        if not text:
+            return
+        candidate = Path(text)
+        if candidate == self._default_download_directory():
+            if DESTINATION_SETTING_KEY in read_settings():
+                write_setting(DESTINATION_SETTING_KEY, "")
+            return
+        if candidate.is_dir():
+            write_setting(DESTINATION_SETTING_KEY, text)
+
+    def _restore_window_geometry(self) -> None:
+        """Put the window back where it was, if that place still exists.
+
+        The stored rectangle is checked against the screens attached now, not
+        the ones attached when it was written.  A corner on a monitor that has
+        gone, a malformed value, or a size below the minimum all fall back to
+        the default window: an unreadable setting must not be able to open the
+        program somewhere the person cannot reach it.
+        """
+
+        stored = read_settings().get(WINDOW_GEOMETRY_SETTING_KEY, "").strip()
+        if not stored:
+            return
+        parts = stored.split(",")
+        if len(parts) != 5:
+            _LOGGER.info("window_geometry_ignored reason=malformed")
+            return
+        try:
+            x, y, width, height, maximized = (int(part.strip()) for part in parts)
+        except ValueError:
+            _LOGGER.info("window_geometry_ignored reason=malformed")
+            return
+        if width <= 0 or height <= 0:
+            _LOGGER.info("window_geometry_ignored reason=malformed")
+            return
+        screen = QApplication.screenAt(QPoint(x, y))
+        if screen is None:
+            _LOGGER.info("window_geometry_ignored reason=offscreen")
+            return
+        available = screen.availableGeometry()
+        minimum = self.minimumSize()
+        width = max(minimum.width(), min(width, available.width()))
+        height = max(minimum.height(), min(height, available.height()))
+        x = max(available.left(), min(x, available.right() - width + 1))
+        y = max(available.top(), min(y, available.bottom() - height + 1))
+        self.setGeometry(x, y, width, height)
+        self._start_maximized = maximized == 1
+
+    def _remember_window_geometry(self) -> None:
+        """Store the rectangle the window would return to, not the maximized one.
+
+        ``normalGeometry`` is what the restore button will restore to, which is
+        the useful value; the maximized state rides along as a fifth field so a
+        window left maximized comes back maximized without guessing at a size
+        the shell chose.
+        """
+
+        geometry = self.normalGeometry()
+        if geometry.width() <= 0 or geometry.height() <= 0:
+            return
+        write_setting(
+            WINDOW_GEOMETRY_SETTING_KEY,
+            f"{geometry.x()},{geometry.y()},{geometry.width()},"
+            f"{geometry.height()},{1 if self.isMaximized() else 0}",
+        )
 
     def _build_title_bar(self) -> QWidget:
         """The replacement for the dropped native frame.
@@ -592,7 +752,9 @@ class MainWindow(QMainWindow):
         not ask and none of them is news.  A dialog that opened by itself to
         say "you are up to date" would be worse than no check, and a dialog
         that opened by itself to say "I could not reach GitHub" would be the
-        connectivity problem presented as an application problem.
+        connectivity problem presented as an application problem.  A release
+        the person pressed **Skip this version** on is the same: the choice is
+        remembered until something newer exists.
 
         When the release publishes ClipDock-Setup.exe the button is Download,
         not Open the release page, and Download installs directly without
@@ -602,7 +764,13 @@ class MainWindow(QMainWindow):
 
         if automatic:
             if result.available:
-                self._show_update_toast(result)
+                if self._update_notice_skipped(result):
+                    _LOGGER.info(
+                        "update_notice_suppressed version=%s reason=skipped",
+                        result.latest,
+                    )
+                else:
+                    self._show_update_toast(result)
             return
 
         if result.available:
@@ -744,6 +912,8 @@ class MainWindow(QMainWindow):
         It offers one thing, and its label says which: Download when the release
         publishes an installer ClipDock can verify and run, or Open the release
         page when it does not.  The notice never starts a download by itself.
+        Beside it, **Skip this version** silences automatic notices for this
+        release only: the manual check and any later release are untouched.
         """
 
         frame = QFrame(self)
@@ -785,11 +955,28 @@ class MainWindow(QMainWindow):
         self._update_toast_note = note
         layout.addWidget(note)
 
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
         open_button = QPushButton("Open the release page", frame)
         open_button.setObjectName("updateToastOpen")
         open_button.clicked.connect(self._open_update_toast_page)
         self._update_toast_open = open_button
-        layout.addWidget(open_button, 0, Qt.AlignmentFlag.AlignLeft)
+        button_row.addWidget(open_button, 0)
+        # A release the person does not want should be able to stop asking.
+        # The choice names the version rather than switching updates off, so a
+        # later release is still news, and the manual check still reports this
+        # one - the button silences the interruption, not the question.
+        skip_button = QPushButton("Skip this version", frame)
+        skip_button.setObjectName("updateToastSkip")
+        skip_button.setToolTip(
+            "Do not show this release automatically again. Help > Check for "
+            "ClipDock updates still reports it."
+        )
+        skip_button.clicked.connect(self._skip_shown_update)
+        self._update_toast_skip = skip_button
+        button_row.addWidget(skip_button, 0)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
         return frame
 
     def _open_update_toast_page(self) -> None:
@@ -1059,6 +1246,9 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_NAME)
         self.setMinimumSize(760, 540)
         self.resize(860, 700)
+        # A link can be dropped anywhere on the window; the handlers decide
+        # what a drop means and never start anything by themselves.
+        self.setAcceptDrops(True)
         # The window draws its own title bar rather than using the native one.
         # Two see-through themes used to make that mandatory, because a native
         # title bar is an opaque grey band; they are gone, but the frameless
@@ -1508,6 +1698,9 @@ class MainWindow(QMainWindow):
         # The window is complete, so the first theme application can be the
         # remembered one.
         self._apply_theme(self._theme)
+        # After the layout and the minimum size exist, so the stored rectangle
+        # is clamped against something real rather than a guess.
+        self._restore_window_geometry()
 
     def _apply_theme(self, theme: str) -> None:
         if theme not in THEME_IDS:
@@ -1640,6 +1833,111 @@ class MainWindow(QMainWindow):
 
         super().showEvent(event)
         self._apply_native_chrome(self._theme_colors(self._theme))
+        # The remembered maximized state is applied here rather than during
+        # construction: setting it earlier would show the window before the
+        # caller asked for it.  The flag is spent once, so a later show() after
+        # a restore does not maximize it again.
+        if self._start_maximized:
+            self._start_maximized = False
+            self.showMaximized()
+
+    @staticmethod
+    def _dropped_links(mime: Any) -> list[str]:
+        """The usable links in a drop, in order, with duplicates removed.
+
+        A browser sends an address-bar drag as a URL and a link dragged out of
+        a page as either a URL or plain text, so both are read.  Each candidate
+        goes through the same validator a pasted link does, which is what keeps
+        a dragged file path from being mistaken for something downloadable.
+        """
+
+        candidates: list[str] = []
+        if mime.hasUrls():
+            candidates.extend(url.toString() for url in mime.urls())
+        if mime.hasText():
+            candidates.extend(mime.text().splitlines())
+        links: list[str] = []
+        seen: set[str] = set()
+        for candidate in candidates:
+            text = candidate.strip()
+            if not text:
+                continue
+            try:
+                normalized = normalize_media_url(text)
+            except UrlValidationError:
+                continue
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            links.append(text)
+        return links
+
+    def dragEnterEvent(self, event: Any) -> None:
+        """Accept the drag only if it actually carries a usable link.
+
+        The cursor is the feedback here, so it has to tell the truth: a folder
+        or a selection of ordinary text does not turn into a download by being
+        dropped, and refusing the drag is clearer than accepting it and then
+        doing nothing.  A running job owns these fields, so nothing is accepted
+        while it does.
+        """
+
+        if self.controller.is_running:
+            event.ignore()
+            return
+        if self._dropped_links(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event: Any) -> None:
+        """Fill the link field, or extend the queue, from what was dropped.
+
+        One link fills the field and stops there: nothing is probed and nothing
+        is downloaded, exactly as if it had been pasted.  Several links switch
+        to the batch queue and are appended, because a batch is the mode that
+        can hold more than one; they are also appended when the queue is
+        already the chosen mode, whatever the count.  The person still presses
+        the button.
+        """
+
+        if self.controller.is_running:
+            event.ignore()
+            return
+        links = self._dropped_links(event.mimeData())
+        if not links:
+            event.ignore()
+            return
+        event.acceptProposedAction()
+        if len(links) == 1 and self._selected_mode() is not DownloadMode.QUEUE:
+            self.url_edit.setText(links[0])
+            self.status_bar.showMessage(
+                "Link dropped. Press Fetch details to read it.", 8000
+            )
+            return
+        if self._selected_mode() is not DownloadMode.QUEUE:
+            self._select_combo_value(self.mode_combo, DownloadMode.QUEUE.value)
+        existing = set(self._queue_links())
+        added: list[str] = []
+        for link in links:
+            normalized = normalize_media_url(link)
+            if normalized in existing:
+                continue
+            existing.add(normalized)
+            added.append(link)
+        if not added:
+            self.status_bar.showMessage(
+                "Those links are already in the queue.", 8000
+            )
+            return
+        current = self.queue_edit.toPlainText().rstrip("\n")
+        self.queue_edit.setPlainText(
+            "\n".join(([current] if current else []) + added)
+        )
+        self.status_bar.showMessage(
+            f"Added {len(added)} link{'s' if len(added) != 1 else ''} to the batch queue.",
+            8000,
+        )
 
     @staticmethod
     def _theme_colors(theme: str) -> dict[str, str]:
@@ -2222,6 +2520,9 @@ class MainWindow(QMainWindow):
         if selected:
             self.destination_edit.setText(selected)
             self._last_directory = Path(selected)
+            # Written now rather than only on close, so the next launch already
+            # knows the folder even if this session ends some other way.
+            write_setting(DESTINATION_SETTING_KEY, selected)
 
     def _fetch_details(self) -> None:
         if self.controller.is_running:
@@ -4379,6 +4680,11 @@ class MainWindow(QMainWindow):
         # Only once the close is actually going ahead: a refused close leaves
         # the window up, and the check should still be waiting for it.
         self._update_check_timer.stop()
+        # What the next launch should inherit.  Both are best-effort: a settings
+        # file that cannot be written must not stop the window from closing.
+        if self.isVisible():
+            self._remember_window_geometry()
+        self._remember_destination()
         if getattr(self, "_update_toast", None) is not None:
             self._update_toast.hide()
         # The history is a child window, and a child left open keeps the
