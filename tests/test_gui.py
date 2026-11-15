@@ -12,7 +12,6 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import tempfile
 import time
 import unittest
-from datetime import date
 from pathlib import Path
 from typing import Any
 from unittest.mock import PropertyMock, patch
@@ -1526,8 +1525,8 @@ class GuiSmokeTests(unittest.TestCase):
     def test_the_automatic_check_waits_for_the_window_and_spends_nothing_arming(self) -> None:
         # "After the window is up and idle rather than during startup": a
         # delay is the whole of that requirement, and a delay of zero would be
-        # startup.  Arming it writes nothing, because a launch that has not
-        # asked a question has not spent the day's question.
+        # startup.  Arming it writes nothing, because a check that has not run
+        # yet has nothing to record.
         window = MainWindow(FakeEngine())
         try:
             self.assertFalse(
@@ -1586,34 +1585,28 @@ class GuiSmokeTests(unittest.TestCase):
             window.close()
             self.app.processEvents()
 
-    def test_the_automatic_check_asks_at_most_once_a_day(self) -> None:
-        # The date is the promise that this cannot become a nag: one request a
-        # day at most, recorded when the attempt starts so that a machine with
-        # no network is not asked again on every single launch.
-        window = MainWindow(FakeEngine())
-        try:
-            window.show()
-            self.app.processEvents()
-            started = self._record_starts(window)
-            self.assertTrue(window.schedule_update_check())
-            window._run_scheduled_update_check()
-            self.assertEqual(len(started), 1, "the first attempt did not ask")
-            self.assertEqual(
-                main_window.read_settings().get(main_window.UPDATE_CHECK_DATE_KEY),
-                date.today().isoformat(),
-            )
-
-            window._update_check_timer.stop()
-            self.assertFalse(window.schedule_update_check())
-            window._run_scheduled_update_check()
-            self.assertEqual(
-                len(started),
-                1,
-                "it asked a second time on the day it had already asked",
-            )
-        finally:
-            window.close()
-            self.app.processEvents()
+    def test_every_launch_checks_again_instead_of_waiting_until_tomorrow(self) -> None:
+        # One check per launch.  A date gate used to keep it to one request a
+        # day, which meant a second launch the same day was silent even with a
+        # newer release waiting - the notice only came back by using the manual
+        # check.  Two windows stand in for two launches.
+        for launch in range(2):
+            with self.subTest(launch=launch):
+                window = MainWindow(FakeEngine())
+                try:
+                    window.show()
+                    self.app.processEvents()
+                    started = self._record_starts(window)
+                    self.assertTrue(
+                        window.schedule_update_check(), "this launch armed nothing"
+                    )
+                    window._run_scheduled_update_check()
+                    self.assertEqual(
+                        len(started), 1, "this launch did not ask GitHub"
+                    )
+                finally:
+                    window.close()
+                    self.app.processEvents()
 
     def test_the_automatic_check_refuses_to_race_a_download(self) -> None:
         # Eight seconds is time enough for the person to have started

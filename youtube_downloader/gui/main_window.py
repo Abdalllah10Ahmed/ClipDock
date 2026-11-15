@@ -3,7 +3,7 @@ from __future__ import annotations
 import ctypes
 import logging
 from ctypes import wintypes
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -118,17 +118,17 @@ TITLE_BAR_HEIGHT = 40
 THEME_SETTING_KEY = "theme"
 # Whether to embed cover art in MP3 downloads.  Stored as "1" or "0".
 EMBED_COVER_SETTING_KEY = "embed_cover"
-# Whether ClipDock may ask GitHub about a newer release on its own, and the
-# date it last did.  Both are stored as plain strings like everything else
-# here: "1"/"0" for the switch, and an ISO date so "has it run today" needs no
-# clock plumbing and survives a machine whose clock was wrong for a moment.
+# Whether ClipDock may ask GitHub about a newer release on its own.  Stored as
+# a plain string, "1" or "0", like everything else here.
 #
-# The switch exists because the check is now automatic, and an unasked-for
-# network request has to be possible to refuse.  The date exists so that a
-# single launch cannot ask repeatedly: one request a day at most, whatever
-# happens.
+# The switch exists because the check is automatic, and an unasked-for network
+# request has to be possible to refuse.  The check itself runs once per launch:
+# a date gate used to keep it to one request a day, but that meant a launch
+# later the same day was silent even when a newer release was waiting, and the
+# only way to hear about it was the manual check.  One request per launch is
+# what the person expects from "check automatically"; it stays well inside
+# GitHub's unauthenticated limit.
 UPDATE_CHECK_SETTING_KEY = "update_check"
-UPDATE_CHECK_DATE_KEY = "update_check_date"
 
 # How long after the window appears before the automatic check runs.  Long
 # enough that startup is genuinely over and the person has had the window for
@@ -387,25 +387,6 @@ class MainWindow(QMainWindow):
     def _set_update_check_enabled(enabled: bool) -> None:
         write_setting(UPDATE_CHECK_SETTING_KEY, "1" if enabled else "0")
 
-    @staticmethod
-    def _update_check_ran_today(today: str | None = None) -> bool:
-        """Whether the automatic check has already been attempted today.
-
-        Recorded when the check *starts* rather than when it succeeds, so the
-        request is bounded to one a day whatever the outcome: an offline
-        machine is not asked to reach GitHub again and again on every launch
-        for a question it could not answer.  The date is passed in by the
-        tests rather than read here, so "today" is a fact the test states
-        instead of one it has to wait for.
-        """
-
-        target = date.today().isoformat() if today is None else today
-        return read_settings().get(UPDATE_CHECK_DATE_KEY) == target
-
-    @staticmethod
-    def _remember_update_check_started() -> None:
-        write_setting(UPDATE_CHECK_DATE_KEY, date.today().isoformat())
-
     def _build_title_bar(self) -> QWidget:
         """The replacement for the dropped native frame.
 
@@ -493,9 +474,9 @@ class MainWindow(QMainWindow):
         self._auto_update_action.setCheckable(True)
         self._auto_update_action.setChecked(self._update_check_enabled())
         self._auto_update_action.setToolTip(
-            "Ask GitHub at most once a day whether a newer ClipDock has been "
-            "published. Nothing is downloaded either way: the most you get is "
-            "a notice in the corner naming the version."
+            "Ask GitHub once each time ClipDock starts whether a newer ClipDock "
+            "has been published. Nothing is downloaded either way: the most you "
+            "get is a notice in the corner naming the version."
         )
         self._auto_update_action.toggled.connect(self._set_update_check_enabled)
         menu.addSeparator()
@@ -554,15 +535,12 @@ class MainWindow(QMainWindow):
         Public because it is the one method here called from outside the
         window, by the application entry point after the window is shown.  The
         whole decision is made here and made once: the switch the person
-        controls, the date that keeps it to one attempt a day, and whether
-        anything else already owns the window.  It is its own method so the
-        decision can be asserted directly instead of by waiting eight seconds
-        for a timer no test should be allowed to let fire.
+        controls and whether anything else already owns the window.  It is its
+        own method so the decision can be asserted directly instead of by
+        waiting for a timer no test should be allowed to let fire.
         """
 
         if not self._update_check_enabled():
-            return False
-        if self._update_check_ran_today():
             return False
         if self.controller.is_running:
             return False
@@ -573,15 +551,13 @@ class MainWindow(QMainWindow):
         """The timer's callback: ask GitHub, and say nothing about it.
 
         Everything is re-checked here rather than trusted from
-        ``schedule_update_check``, because eight seconds is time enough for
-        the person to have started something else, and a check that raced a
+        ``schedule_update_check``, because the delay is time enough for the
+        person to have started something else, and a check that raced a
         download would be asking for the fight ``_check_for_updates`` already
         refuses to pick.
 
         Silence is the default on purpose.  Nothing is written to the status
-        bar, the progress bar is not touched, no dialog opens, and the date is
-        recorded here rather than in the scheduler so that a window closed
-        before the delay elapsed has not spent the day.
+        bar, the progress bar is not touched, and no dialog opens.
         """
 
         if not self.isVisible():
@@ -589,13 +565,10 @@ class MainWindow(QMainWindow):
             # child of the window and is stopped by closeEvent as well, so
             # this is the belt to that pair of braces.
             return
-        if not self._update_check_enabled() or self._update_check_ran_today():
+        if not self._update_check_enabled():
             return
         if self.controller.is_running:
-            # Not recorded: whoever is downloading decided this launch's
-            # answer, so the next launch gets to ask again.
             return
-        self._remember_update_check_started()
         self._update_check_automatic = True
         # No message.  The automatic check does not announce itself, because
         # saying nothing when there is nothing to say is the whole point of

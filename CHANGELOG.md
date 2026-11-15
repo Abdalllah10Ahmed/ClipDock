@@ -15,6 +15,12 @@ printed at the end of `scripts/build_installer.ps1`.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-15
+
+### Fixed
+
+- **The automatic update notice appears on every launch again.** The check was limited to one request per calendar day, so a second launch that day stayed silent even when a newer release was waiting - the notice only came back by pressing **Check for updates** in the Help menu. The automatic check now runs once per launch (about 1.5 seconds after the window appears), still obeys the **Check for updates automatically** switch, and still says nothing at all when there is nothing new to report.
+
 ## [0.5.1] - 2026-11-15
 
 ### Fixed
@@ -302,7 +308,8 @@ First public release. Everything below is new.
 - No runtime dependency beyond PySide6 and yt-dlp; both are bundled. FFmpeg is
   the only thing ever downloaded, and only after asking.
 
-[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.0...v0.4.1
