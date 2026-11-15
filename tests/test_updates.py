@@ -416,6 +416,45 @@ class DownloadTests(unittest.TestCase):
             self.assertIn("redirected away", caught.exception.message)
             self.assertEqual(list(Path(directory).iterdir()), [])
 
+    def test_the_github_release_cdn_redirect_is_accepted(self) -> None:
+        # GitHub does not serve release assets from github.com itself.  It
+        # redirects to a CDN, and the CDN host has changed before (objects ->
+        # github-releases -> release-assets), so every githubusercontent.com
+        # subdomain is trusted rather than one hard-coded name.
+        hosts = (
+            "objects.githubusercontent.com",
+            "github-releases.githubusercontent.com",
+            "release-assets.githubusercontent.com",
+        )
+        for host in hosts:
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as directory:
+                url = f"https://{host}/asset"
+                result = download_update(
+                    installer_check(b"installer"),
+                    Path(directory),
+                    opener=lambda *a, url=url, **k: DownloadResponse(
+                        b"installer", url=url
+                    ),
+                )
+                self.assertEqual(result.path.read_bytes(), b"installer")
+
+    def test_a_lookalike_host_is_not_mistaken_for_github(self) -> None:
+        # The allow-list must require a real subdomain boundary: a registrable
+        # domain that merely ends in the same letters is somebody else's host.
+        for host in ("evilgithubusercontent.com", "githubusercontent.com.example.test"):
+            with self.subTest(host=host), tempfile.TemporaryDirectory() as directory:
+                url = f"https://{host}/asset"
+                with self.assertRaises(DownloadFailure) as caught:
+                    download_update(
+                        installer_check(b"installer"),
+                        Path(directory),
+                        opener=lambda *a, url=url, **k: DownloadResponse(
+                            b"installer", url=url
+                        ),
+                    )
+                self.assertIn("redirected away", caught.exception.message)
+                self.assertEqual(list(Path(directory).iterdir()), [])
+
     def test_a_check_that_names_no_installer_downloads_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaises(DownloadFailure):

@@ -74,11 +74,13 @@ DOWNLOAD_CHUNK = 256 * 1024
 DEFAULT_TIMEOUT = 8.0
 DOWNLOAD_TIMEOUT = 30.0
 
-# The hosts a redirect may land on.  GitHub serves release assets from
-# objects.githubusercontent.com; the first request is always github.com.
-_ALLOWED_DOWNLOAD_HOSTS = frozenset(
-    {"github.com", "objects.githubusercontent.com", "github-releases.githubusercontent.com"}
-)
+# The hosts a redirect may land on.  The first request is always github.com;
+# GitHub then serves the asset from one of its CDN hosts.  It has used
+# objects.githubusercontent.com and github-releases.githubusercontent.com, and
+# now redirects to release-assets.githubusercontent.com, so any subdomain of
+# githubusercontent.com is accepted rather than pinning today's CDN name.
+_ALLOWED_DOWNLOAD_HOSTS = frozenset({"github.com"})
+_ALLOWED_DOWNLOAD_SUFFIXES = (".githubusercontent.com",)
 
 _SHA256 = re.compile(r"^sha256:([0-9a-f]{64})$", re.IGNORECASE)
 
@@ -348,7 +350,16 @@ def _trusted_final_url(url: str) -> bool:
     """Whether a redirect landed somewhere the installer may come from."""
 
     parsed = urllib.parse.urlsplit(url)
-    return parsed.scheme == "https" and parsed.hostname in _ALLOWED_DOWNLOAD_HOSTS
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    if host in _ALLOWED_DOWNLOAD_HOSTS:
+        return True
+    # The leading dot in the suffix matters: it keeps "evilgithubusercontent.com"
+    # from matching as though it were a GitHub host.
+    return any(host.endswith(suffix) for suffix in _ALLOWED_DOWNLOAD_SUFFIXES)
 
 
 def _download_failure(error: BaseException) -> DownloadFailure:

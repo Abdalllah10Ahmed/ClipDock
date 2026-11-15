@@ -136,7 +136,7 @@ UPDATE_CHECK_DATE_KEY = "update_check_date"
 # it.  It is deliberately not zero: the check is a network request competing
 # with nothing in particular, and doing it during startup would make launch
 # slower for everyone to benefit the few who have an update waiting.
-UPDATE_CHECK_DELAY_MS = 8000
+UPDATE_CHECK_DELAY_MS = 1500
 
 _LOGGER = logging.getLogger(__name__)
 

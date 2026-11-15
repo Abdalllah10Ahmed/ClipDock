@@ -15,6 +15,13 @@ printed at the end of `scripts/build_installer.ps1`.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-15
+
+### Fixed
+
+- **Update downloads from GitHub's current release CDN.** GitHub redirects release assets to `release-assets.githubusercontent.com`, which the download allow-list did not include, so choosing **Download update** ended with "redirected away from GitHub". Any `*.githubusercontent.com` host is now accepted, while lookalike domains are still refused.
+- **The automatic update notice appears sooner.** The once-a-day check now starts 1.5 seconds after the window appears instead of 8 seconds.
+
 ## [0.5.0] - 2026-11-13
 
 ### Changed
@@ -295,7 +302,8 @@ First public release. Everything below is new.
 - No runtime dependency beyond PySide6 and yt-dlp; both are bundled. FFmpeg is
   the only thing ever downloaded, and only after asking.
 
-[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Abdalllah10Ahmed/ClipDock/compare/v0.3.0...v0.4.0
