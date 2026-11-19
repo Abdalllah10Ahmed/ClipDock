@@ -1,10 +1,12 @@
 # ClipDock
 
-[![CI](https://github.com/Abdalllah10Ahmed/ClipDock/actions/workflows/ci.yml/badge.svg)](https://github.com/Abdalllah10Ahmed/ClipDock/actions/workflows/ci.yml)
-[![Downloads](https://img.shields.io/github/downloads/Abdalllah10Ahmed/ClipDock/total)](https://github.com/Abdalllah10Ahmed/ClipDock/releases)
-[![Latest release](https://img.shields.io/github/v/release/Abdalllah10Ahmed/ClipDock)](https://github.com/Abdalllah10Ahmed/ClipDock/releases/latest)
-[![License](https://img.shields.io/github/license/Abdalllah10Ahmed/ClipDock)](LICENSE)
-![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6)
+<p align="center">
+  <a href="https://github.com/Abdalllah10Ahmed/ClipDock/actions/workflows/ci.yml"><img src="https://github.com/Abdalllah10Ahmed/ClipDock/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <a href="https://github.com/Abdalllah10Ahmed/ClipDock/releases"><img src="https://img.shields.io/github/downloads/Abdalllah10Ahmed/ClipDock/total" alt="Downloads" /></a>
+  <a href="https://github.com/Abdalllah10Ahmed/ClipDock/releases/latest"><img src="https://img.shields.io/github/v/release/Abdalllah10Ahmed/ClipDock" alt="Latest release" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/github/license/Abdalllah10Ahmed/ClipDock" alt="License" /></a>
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6" alt="Platform: Windows 10/11" />
+</p>
 
 Windows desktop app to download video, audio, thumbnails, and manual captions from popular sites (best-effort, powered by [yt-dlp](https://github.com/yt-dlp/yt-dlp)).
 
