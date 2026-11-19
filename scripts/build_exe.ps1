@@ -65,7 +65,7 @@ New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 # Task Manager, file Properties and Windows' installed-programs list all show
 # nothing for it - while ClipDock-Setup.exe identifies itself perfectly well,
 # because Inno Setup writes a resource of its own.  The asymmetry was recorded as
-# an open item at PROJECT_MAP.md:266.
+# an open item at dev/PROJECT_MAP.md:266.
 #
 # The file is generated rather than committed because a committed copy is a
 # second place a version can be typed, and this project has already paid for two
@@ -150,7 +150,7 @@ if ($Slim) {
 } else {
     Copy-Item (Join-Path $root "vendor") $appDir -Recurse
 }
-Copy-Item (Join-Path $root "THIRD_PARTY_NOTICES.md") $appDir
+Copy-Item (Join-Path $root "dev\THIRD_PARTY_NOTICES.md") $appDir
 Copy-Item (Join-Path $root "README.md") $appDir
 # The .ico is baked into the executable already; PyInstaller's --icon option
 # only sets the executable's own resource.  It also has to exist as a file at

@@ -502,7 +502,7 @@ class VersionResourceTests(unittest.TestCase):
     programs list all showed nothing for it.  `ClipDock-Setup.exe` identifies
     itself correctly, because Inno Setup writes a resource of its own - so the
     installer named a version while the program it installed named none.  That
-    was PROJECT_MAP.md:266.
+    was dev/PROJECT_MAP.md:266.
 
     The resource is generated rather than committed, which is the point of these
     tests.  A committed version file would be a fifth copy of the version, and

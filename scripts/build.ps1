@@ -29,7 +29,7 @@ Copy-Item (Join-Path $root "youtube_downloader") $appDir -Recurse
 Copy-Item (Join-Path $root "vendor") $appDir -Recurse
 Copy-Item (Join-Path $root "requirements.txt") $appDir
 Copy-Item (Join-Path $root "README.md") $appDir
-Copy-Item (Join-Path $root "THIRD_PARTY_NOTICES.md") $appDir
+Copy-Item (Join-Path $root "dev\THIRD_PARTY_NOTICES.md") $appDir
 Copy-Item (Join-Path $root "scripts") $appDir -Recurse
 Copy-Item (Join-Path $root "tools") $appDir -Recurse
 Get-ChildItem $appDir -Directory -Filter "__pycache__" -Recurse | Remove-Item -Recurse -Force

@@ -80,7 +80,7 @@ cd ClipDock
 .\scripts\build_installer.ps1
 ```
 
-See `scripts/` for additional build options and `CHANGELOG.md` for release notes.
+See `scripts/` for additional build options and [CHANGELOG.md](dev/CHANGELOG.md) for release notes.
 
 ## Disclaimer
 
@@ -89,4 +89,4 @@ Only download content you own or are authorized to download. You are responsible
 ## License
 
 - ClipDock source: see [LICENSE](LICENSE).
-- Third-party components: see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+- Third-party components: see [THIRD_PARTY_NOTICES.md](dev/THIRD_PARTY_NOTICES.md).
