@@ -98,6 +98,13 @@ class FakeEngine:
             ),
         )
 
+    def download_queue(self, request, *, progress=None, cancel_check=None):
+        # The window calls this dedicated method for a batch; the real engine
+        # has had it since queues became their own operation.  Without it the
+        # fake raised AttributeError inside the worker, which the window showed
+        # as a modal error dialog - and an unattended CI run waited forever.
+        return self._download_queue(request, progress=progress)
+
     def download(self, request, *, progress=None, cancel_check=None):
         if isinstance(request, QueueDownloadRequest):
             return self._download_queue(request, progress=progress)
@@ -1137,6 +1144,49 @@ class GuiSmokeTests(unittest.TestCase):
         self.assertEqual(restored.theme_combo.currentData(), "gruvbox")
         restored.close()
         self.app.processEvents()
+
+    def test_opening_windows_does_not_restyle_the_whole_application(self) -> None:
+        # QApplication.setStyleSheet re-polishes every widget in the process,
+        # not just the new window.  Calling it for each window made the suite
+        # (and any long session that kept windows open) slow down quadratically
+        # until the CI job ran out of time.  Opening a window must reuse the
+        # application sheet; only a change of theme may replace it.
+        app = QApplication.instance()
+        assert app is not None
+        key = main_window.APP_STYLESHEET_PROPERTY
+        original = app.property(key)
+        app.setProperty(key, None)
+        self.addCleanup(app.setProperty, key, original)
+        real_set_style_sheet = QApplication.setStyleSheet
+        application_sheets: list[str] = []
+
+        def record(self: Any, sheet: str) -> Any:
+            if self is app:
+                application_sheets.append(sheet)
+            return real_set_style_sheet(self, sheet)
+
+        with patch.object(QApplication, "setStyleSheet", record):
+            windows = [MainWindow(FakeEngine()) for _ in range(4)]
+            self.assertEqual(
+                len(application_sheets),
+                1,
+                "each new window replaced the application-wide stylesheet",
+            )
+            windows[-1]._apply_theme("gruvbox")
+            self.assertEqual(
+                len(application_sheets),
+                2,
+                "a changed theme did not replace the application stylesheet",
+            )
+            windows[-1]._apply_theme("gruvbox")
+            self.assertEqual(
+                len(application_sheets),
+                2,
+                "reapplying the same theme replaced the stylesheet again",
+            )
+            for window in windows:
+                window.close()
+            self.app.processEvents()
 
     def test_a_saved_theme_that_no_longer_exists_falls_back(self) -> None:
         # A real case, not a hypothetical one: the two see-through themes were

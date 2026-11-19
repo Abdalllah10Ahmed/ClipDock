@@ -117,6 +117,12 @@ TITLE_BAR_HEIGHT = 40
 
 # The settings key the chosen theme is stored under.
 THEME_SETTING_KEY = "theme"
+# Qt reparses the sheet and re-polishes every widget in the *application* on
+# every QApplication.setStyleSheet call.  A new window does not need that: it
+# gets its own sheet below, and the application one only has to change when the
+# theme changes.  Recording the applied sheet on the application keeps opening
+# a second window from getting slower with every window already created.
+APP_STYLESHEET_PROPERTY = "clipdockAppliedStylesheet"
 # Whether to embed cover art in MP3 downloads.  Stored as "1" or "0".
 EMBED_COVER_SETTING_KEY = "embed_cover"
 # Whether ClipDock may ask GitHub about a newer release on its own.  Stored as
@@ -1739,9 +1745,14 @@ class MainWindow(QMainWindow):
         # window so native combo-box popups and message boxes remain readable.
         stylesheet = self._stylesheet(colors)
         app = QApplication.instance()
-        if app is not None:
+        if app is not None and app.property(APP_STYLESHEET_PROPERTY) != stylesheet:
+            # The application-wide sheet is shared by every window, so setting
+            # it again would re-polish all of them for no visual change.  This
+            # window still gets its own sheet just below; the application one
+            # is only replaced when the theme actually differs.
             app.setPalette(palette)
             app.setStyleSheet(stylesheet)
+            app.setProperty(APP_STYLESHEET_PROPERTY, stylesheet)
         self.setPalette(palette)
         self.setStyleSheet(stylesheet)
         self._apply_native_chrome(colors)
