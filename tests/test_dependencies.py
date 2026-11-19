@@ -202,7 +202,7 @@ class DependencyReportTests(unittest.TestCase):
                 present=False,
                 path=None,
                 needed_for="merging",
-                download_bytes=171_546_855,
+                download_bytes=dependencies.FFMPEG_DOWNLOAD_BYTES,
             )
         )
         self.assertIn("whole computer", text)

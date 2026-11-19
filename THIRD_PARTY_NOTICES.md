@@ -24,9 +24,9 @@ This project is intended for Windows 10/11 and uses the following third-party co
 ## FFmpeg
 
 - Version: 9.0.2
-- Windows build: BtbN FFmpeg-Builds `n9.0.2-3-ga5923073bf`, win64 LGPL 9.0 archive
-- Project: https://ffmpeg.org/ and https://github.com/BtbN/FFmpeg-Builds
-- License: the build is distributed under the LGPL configuration recorded in `vendor/ffmpeg/VERSION.txt` and the upstream FFmpeg license notices.
+- Windows build: FFmpeg-Builds `n9.0.2-39-g7adfbe40dc`, win64 GPL 9.0 archive from the archived `autobuild-2026-10-31-12-59` release
+- Project: https://ffmpeg.org/ and https://github.com/FFmpeg-Builds/FFmpeg-Builds
+- License: the build is distributed under the GPL configuration recorded in `vendor/ffmpeg/VERSION.txt` and the upstream FFmpeg license notices.
 
 The dependency fetch script verifies the archive SHA-256 and the extracted `ffmpeg.exe` SHA-256 value before installation. `ffprobe.exe` is not extracted and is not redistributed; the application never invokes it. Do not remove the accompanying license and source-information notices when redistributing a bundle.
 

@@ -58,20 +58,25 @@ _LOGGER = logging.getLogger(__name__)
 # than repeating them, so a build can never ship a binary the application would
 # then refuse to install.
 FFMPEG_VERSION = "9.0.2"
-FFMPEG_BUILD = "n9.0.2-45-g1e65c6cd5d"
+FFMPEG_BUILD = "n9.0.2-39-g7adfbe40dc"
+# The end-of-month autobuild is kept by upstream; the daily ones are rotated
+# away after about two weeks.  A pin into a daily tag made CI fail with a 404
+# once the build aged out, so this points at the archived 2026-10-31 release
+# instead.  The exact build and both hashes are still pinned, so the download
+# is verified rather than merely available.
 FFMPEG_URL = (
-    "https://github.com/BtbN/FFmpeg-Builds/releases/download/"
-    "autobuild-2026-11-02-12-51/"
-    "ffmpeg-n9.0.2-45-g1e65c6cd5d-win64-gpl-9.0.zip"
+    "https://github.com/FFmpeg-Builds/FFmpeg-Builds/releases/download/"
+    "autobuild-2026-10-31-12-59/"
+    "ffmpeg-n9.0.2-39-g7adfbe40dc-win64-gpl-9.0.zip"
 )
-FFMPEG_ARCHIVE_SHA256 = "20e6537e293473506d79ef4a6b203bc6b9735a9d3d225c28e05ef968b3438116"
-FFMPEG_BINARY_SHA256 = "52c1b59d92a82ac8157fdc5ac056d33fd8c206362fbdd9bc6a48831e6f0e9651"
+FFMPEG_ARCHIVE_SHA256 = "693f3e224bc184b40524a62ca47526cfebaf2504414021b92fe75f677ad868b9"
+FFMPEG_BINARY_SHA256 = "c930b63cb1ee8b7e2eaf9c15161160edd5c9acad34f0303b5855c8eb142a7e8d"
 
-# The archive carries every configuration BtbN publishes, which is why it is so
-# much larger than the single binary that is actually kept.  This is the size
-# the user is asked to agree to, so it is a constant rather than a guess.
-FFMPEG_DOWNLOAD_BYTES = 171_546_855
-FFMPEG_INSTALLED_BYTES = 128_300_000
+# The archive carries every configuration upstream publishes, which is why it
+# is so much larger than the single binary that is actually kept.  This is the
+# size the user is asked to agree to, so it is a constant rather than a guess.
+FFMPEG_DOWNLOAD_BYTES = 195_110_184
+FFMPEG_INSTALLED_BYTES = 165_984_256
 
 _RUNTIME_FOLDER = "runtime"
 _DATA_DIRECTORY = "ClipDock"
